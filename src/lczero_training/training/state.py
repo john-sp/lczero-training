@@ -126,10 +126,12 @@ class TrainingState:
 
     @staticmethod
     def new_from_config(
-        model_config: ModelConfig, training_config: TrainingConfig
+        model_config: ModelConfig,
+        training_config: TrainingConfig,
     ) -> "TrainingState":
         rngs = nnx.Rngs(params=42)
         model_state = nnx.state(LczeroModel(config=model_config, rngs=rngs))
+
         lr_sched = make_lr_schedule(training_config.lr_schedule)
         opt_state = make_gradient_transformation(
             training_config.optimizer,

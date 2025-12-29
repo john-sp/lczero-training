@@ -5,6 +5,11 @@ import "proto/hlo.proto";
 
 package lczero.training;
 
+enum NormType {
+  NORM_LAYER_NORM = 0;
+  NORM_RMS_NORM = 1;
+}
+
 message ModelConfig {
   optional DefaultsConfig defaults = 4;
   optional EmbeddingConfig embedding = 5;
@@ -19,6 +24,7 @@ message DefaultsConfig {
   optional pblczero.XlaShapeProto.Type compute_dtype = 2;
   optional pblczero.NetworkFormat.ActivationFunction activation = 4;
   optional pblczero.NetworkFormat.ActivationFunction ffn_activation = 5;
+  optional NormType norm_type = 6;
 }
 
 message EmbeddingConfig {

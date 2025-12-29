@@ -87,6 +87,8 @@ def init(
         sys.exit(1)
 
     logger.info("Creating initial training state from configuration")
+    
+    # Initialize without teacher first to allow safe restoration from old checkpoints
     training_state = TrainingState.new_from_config(
         model_config=config.model,
         training_config=config.training,
@@ -102,7 +104,7 @@ def init(
             source_mgr.latest_step(),
             args=ocp.args.PyTreeRestore(training_state),
         )
-
+        
     swa_enabled = config.training.HasField("swa")
 
     if lczero_model is None:

@@ -16,8 +16,11 @@ def _make_nadamw_weight_decay_mask(
 ) -> nnx.State:
     """Creates a mask that excludes bias and LayerNorm parameters from decay."""
 
-    def is_layer_norm(path: tuple[object, ...]) -> bool:
-        return any(str(s).startswith("ln") for s in path)
+    def is_norm_layer(path: tuple[object, ...]) -> bool:
+        # Matches "ln1", "ln2", "norm", "out_norm"
+        return any(
+            str(s).startswith("ln") or str(s).endswith("norm") for s in path
+        )
 
     def is_embedding(path: tuple[object, ...]) -> bool:
         return ("embedding", "embedding") in zip(path, path[1:])
@@ -40,7 +43,7 @@ def _make_nadamw_weight_decay_mask(
     def mask_fn(path: tuple[object, ...], variable: nnx.Variable) -> bool:
         if is_bias(path) and not config.decay_biases:
             return False
-        if is_layer_norm(path) and not config.decay_layer_norms:
+        if is_norm_layer(path) and not config.decay_layer_norms:
             return False
         if is_embedding(path) and not config.decay_embedding:
             return False

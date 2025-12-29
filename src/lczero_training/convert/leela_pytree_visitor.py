@@ -109,7 +109,8 @@ class LeelaPytreeWeightsVisitor:
         biases: net_pb2.Weights.Layer,
     ) -> None:
         self.tensor(nnx_dict["scale"], scales)
-        self.tensor(nnx_dict["bias"], biases)
+        if "bias" in nnx_dict:
+            self.tensor(nnx_dict["bias"], biases)
 
     def policy_heads(
         self, nnx_dict: nnx.State, weights: net_pb2.Weights.PolicyHeads

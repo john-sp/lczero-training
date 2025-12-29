@@ -43,22 +43,37 @@ def _prepare_batch(batch_tuple: tuple) -> TrainingBatch:
     )
 
 
-def _make_eval_step(graphdef: nnx.GraphDef, loss_fn: LczeroLoss) -> Any:
+def _make_eval_step(
+    graphdef: nnx.GraphDef,
+    loss_fn: LczeroLoss,
+    teacher_graphdef: Optional[nnx.GraphDef] = None,
+) -> Any:
     @partial(nnx.jit, static_argnames=())
     def eval_step(
-        model_state: nnx.State, batch: TrainingBatch
+        model_state: nnx.State,
+        batch: TrainingBatch,
+        teacher_model_state: Optional[nnx.State] = None,
     ) -> tuple[jax.Array, Any]:
         model = nnx.merge(graphdef, model_state)
+        teacher_model = (
+            nnx.merge(teacher_graphdef, teacher_model_state)
+            if teacher_graphdef is not None and teacher_model_state is not None
+            else None
+        )
 
         def loss_for_batch(
-            model_arg: LczeroModel, sample_arg: TrainingSample
+            model_arg: LczeroModel,
+            sample_arg: TrainingSample,
+            teacher_model_arg: Optional[LczeroModel] = None,
         ) -> tuple[jax.Array, Any]:
-            return loss_fn(model_arg, sample_arg)
+            return loss_fn(model_arg, sample_arg, teacher_model_arg)
 
-        loss_vfn = jax.vmap(loss_for_batch, in_axes=(None, 0), out_axes=0)
+        loss_vfn = jax.vmap(loss_for_batch, in_axes=(None, 0, None), out_axes=0)
         # vmap automatically distributes TrainingBatch over batch dimension,
         # calling loss_for_batch with TrainingSample (single samples).
-        per_sample_loss, unweighted_losses = loss_vfn(model, batch)  # type: ignore[arg-type]
+        per_sample_loss, unweighted_losses = loss_vfn(
+            model, batch, teacher_model  # type: ignore[arg-type]
+        )
         mean_loss = jnp.mean(per_sample_loss)
         mean_unweighted = tree_util.tree_map(jnp.mean, unweighted_losses)
         return mean_loss, mean_unweighted
@@ -102,6 +117,12 @@ def overfit(
     prepared_batch_b = _prepare_batch(batch_b) if batch_b is not None else None
 
     logger.info("Creating training state from configuration")
+    teacher_model_config = (
+        config.training.teacher.model
+        if config.training.HasField("teacher")
+        and config.training.teacher.HasField("model")
+        else None
+    )
     training_state = TrainingState.new_from_config(
         model_config=config.model,
         training_config=config.training,
@@ -111,6 +132,31 @@ def overfit(
         LczeroModel(config=config.model, rngs=nnx.Rngs(params=42))
     )
 
+    teacher_graphdef = None
+    teacher_model_state = None
+    if config.training.HasField("teacher") and teacher_model_config is not None:
+        teacher_config = config.training.teacher
+        import orbax.checkpoint as ocp
+
+        logger.info(f"Loading teacher from {teacher_config.checkpoint_path}")
+        teacher_mgr = ocp.CheckpointManager(
+            teacher_config.checkpoint_path,
+            options=ocp.CheckpointManagerOptions(create=False),
+        )
+        teacher_empty_state = TrainingState.new_from_config(
+            model_config=teacher_model_config,
+            training_config=config.training,
+        )
+        restored_teacher_state = teacher_mgr.restore(
+            None, args=ocp.args.PyTreeRestore(teacher_empty_state)
+        )
+        assert isinstance(restored_teacher_state, TrainingState)
+        teacher_model_state = restored_teacher_state.jit_state.model_state
+
+        teacher_graphdef, _ = nnx.split(
+            LczeroModel(config=teacher_model_config, rngs=nnx.Rngs(params=42))
+        )
+
     jit_state = training_state.jit_state
     lr_sched = make_lr_schedule(config.training.lr_schedule)
     optimizer_tx = make_gradient_transformation(
@@ -119,13 +165,19 @@ def overfit(
         lr_schedule=lr_sched,
     )
 
-    loss_fn = LczeroLoss(config=config.training.losses)
+    loss_fn = LczeroLoss(
+        config=config.training.losses,
+        teacher_config=(
+            config.training.teacher if config.training.HasField("teacher") else None
+        ),
+    )
     training = Training(
         optimizer_tx=optimizer_tx,
         graphdef=graphdef,
         loss_fn=loss_fn,
+        teacher_graphdef=teacher_graphdef,
     )
-    eval_step = _make_eval_step(graphdef, loss_fn)
+    eval_step = _make_eval_step(graphdef, loss_fn, teacher_graphdef)
 
     csv_handle = None
     csv_writer: Any | None = None
@@ -218,6 +270,7 @@ def overfit(
                         optimizer_tx,
                         jit_state,
                         train_batch,
+                        teacher_model_state,
                     )
                     loss = metrics["loss"]
                     unweighted_losses = metrics["unweighted_losses"]
@@ -230,7 +283,9 @@ def overfit(
                     )
 
                     eval_loss, eval_unweighted = eval_step(
-                        jit_state.model_state, eval_batch
+                        jit_state.model_state,
+                        eval_batch,
+                        teacher_model_state,
                     )
                     eval_loss, eval_unweighted = jax.device_get(
                         (eval_loss, eval_unweighted)
@@ -262,6 +317,7 @@ def overfit(
                     optimizer_tx,
                     jit_state,
                     prepared_batch_a,
+                    teacher_model_state,
                 )
                 loss = metrics["loss"]
                 unweighted_losses = metrics["unweighted_losses"]
