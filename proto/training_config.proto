@@ -14,6 +14,17 @@ message TrainingConfig {
   // Stochastic Weight Averaging (SWA) configuration. When absent, SWA is
   // disabled.
   SWAConfig swa = 7;
+  // Teacher configuration for knowledge distillation.
+  TeacherConfig teacher = 8;
+}
+
+import "proto/model_config.proto";
+
+message TeacherConfig {
+  string checkpoint_path = 1;
+  float kd_alpha = 2;
+  float temperature = 3;
+  ModelConfig model = 4;
 }
 
 message ScheduleConfig {

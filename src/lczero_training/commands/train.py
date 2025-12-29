@@ -53,6 +53,14 @@ def train(config_filename: str) -> None:
     )
 
     logging.info("Creating state from configuration")
+    teacher_model_config = (
+        config.training.teacher.model
+        if config.training.HasField("teacher")
+        and config.training.teacher.HasField("model")
+        else None
+    )
+    # Initialize empty state without teacher model to ensure we can restore
+    # from checkpoints that don't have it. We'll load the teacher separately.
     empty_state = TrainingState.new_from_config(
         model_config=config.model,
         training_config=config.training,
@@ -62,6 +70,30 @@ def train(config_filename: str) -> None:
         None, args=ocp.args.PyTreeRestore(empty_state)
     )
     logging.info("Restored checkpoint")
+
+    teacher_graphdef = None
+    teacher_model_state = None
+    if config.training.HasField("teacher") and teacher_model_config is not None:
+        teacher_config = config.training.teacher
+        logging.info(f"Loading teacher from {teacher_config.checkpoint_path}")
+        teacher_mgr = ocp.CheckpointManager(
+            teacher_config.checkpoint_path,
+            options=ocp.CheckpointManagerOptions(create=False),
+        )
+        # Assuming the teacher checkpoint contains a TrainingState
+        teacher_empty_state = TrainingState.new_from_config(
+            model_config=teacher_model_config,
+            training_config=config.training,
+        )
+        restored_teacher_state = teacher_mgr.restore(
+            None, args=ocp.args.PyTreeRestore(teacher_empty_state)
+        )
+        assert isinstance(restored_teacher_state, TrainingState)
+        teacher_model_state = restored_teacher_state.jit_state.model_state
+
+        teacher_graphdef, _ = nnx.split(
+            LczeroModel(config=teacher_model_config, rngs=nnx.Rngs(params=42))
+        )
 
     model, _ = nnx.split(
         LczeroModel(config=config.model, rngs=nnx.Rngs(params=42))
@@ -79,15 +111,24 @@ def train(config_filename: str) -> None:
     training = Training(
         optimizer_tx=optimizer_tx,
         graphdef=model,
-        loss_fn=LczeroLoss(config=config.training.losses),
+        loss_fn=LczeroLoss(
+            config=config.training.losses,
+            teacher_config=(
+                config.training.teacher
+                if config.training.HasField("teacher")
+                else None
+            ),
+        ),
         swa_config=(
             config.training.swa if config.training.HasField("swa") else None
         ),
+        teacher_graphdef=teacher_graphdef,
     )
     new_state = training.run(
         jit_state,
         from_dataloader(make_dataloader(config.data_loader)),
         config.training.schedule.steps_per_network,
+        teacher_model_state=teacher_model_state,
     )
 
     if config.export.destination_filename:

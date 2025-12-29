@@ -9,7 +9,7 @@ from flax.linen import initializers as flax_initializers
 from proto import model_config_pb2
 
 from .shared import Ffn
-from .utils import get_activation
+from .utils import get_activation, get_norm_layer
 
 
 class EncoderTower(nnx.Module):
@@ -74,7 +74,8 @@ class EncoderBlock(nnx.Module):
         )
 
         self.alpha = math.pow(2.0 * config.num_blocks, -0.25)
-        self.ln1 = nnx.LayerNorm(in_features, epsilon=1e-3, rngs=rngs)
+        norm_layer = get_norm_layer(defaults.norm_type)
+        self.ln1 = norm_layer(in_features, epsilon=1e-3, rngs=rngs)
         self.ffn = Ffn(
             in_features=in_features,
             hidden_features=config.dff,
@@ -82,7 +83,7 @@ class EncoderBlock(nnx.Module):
             deepnorm_beta=deepnorm_beta,
             rngs=rngs,
         )
-        self.ln2 = nnx.LayerNorm(in_features, epsilon=1e-3, rngs=rngs)
+        self.ln2 = norm_layer(in_features, epsilon=1e-3, rngs=rngs)
 
     def __call__(self, x: jax.Array) -> jax.Array:
         x = x + self.mha(x) * self.alpha
@@ -189,6 +190,7 @@ class Smolgen(nnx.Module):
         rngs: nnx.Rngs,
     ):
         self.heads = heads
+        norm_layer = get_norm_layer(defaults.norm_type)
         self.compress = nnx.Linear(
             in_features=in_features,
             out_features=config.hidden_channels,
@@ -200,14 +202,14 @@ class Smolgen(nnx.Module):
             out_features=config.hidden_size,
             rngs=rngs,
         )
-        self.ln1 = nnx.LayerNorm(config.hidden_size, epsilon=1e-3, rngs=rngs)
+        self.ln1 = norm_layer(config.hidden_size, epsilon=1e-3, rngs=rngs)
 
         self.dense2 = nnx.Linear(
             in_features=config.hidden_size,
             out_features=config.gen_size * heads,
             rngs=rngs,
         )
-        self.ln2 = nnx.LayerNorm(
+        self.ln2 = norm_layer(
             config.gen_size * heads, epsilon=1e-3, rngs=rngs
         )
         self.weight_gen_dense = weight_gen_dense

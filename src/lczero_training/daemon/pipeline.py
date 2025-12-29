@@ -112,6 +112,7 @@ class TrainingPipeline:
     _training_state: TrainingState
     _cycle_state: _TrainingCycleState
     _metrics: Metrics | None
+    _teacher_model_state: Optional[nnx.State]
 
     def __init__(self, config_filepath: str) -> None:
         logger.info(f"Loading config from {config_filepath}")
@@ -124,6 +125,7 @@ class TrainingPipeline:
         self._cycle_state = _TrainingCycleState()
         self._force_training_event = threading.Event()
         self._metrics = None
+        self._teacher_model_state = None
         logger.info("Creating empty model")
         self._model = LczeroModel(self._config.model, rngs=nnx.Rngs(params=42))
         logger.info(
@@ -147,6 +149,8 @@ class TrainingPipeline:
             lr_schedule=self._lr_schedule,
         )
         model_state = nnx.state(self._model)
+        
+        # Initialize empty state without teacher for restoration compatibility
         jit_state = JitTrainingState(
             step=0,
             model_state=model_state,
@@ -168,8 +172,48 @@ class TrainingPipeline:
             ),
         )
 
+        teacher_model_config = (
+            self._config.training.teacher.model
+            if self._config.training.HasField("teacher")
+            and self._config.training.teacher.HasField("model")
+            else None
+        )
+        teacher_graphdef = None
+        if (
+            self._config.training.HasField("teacher")
+            and teacher_model_config is not None
+        ):
+            teacher_config = self._config.training.teacher
+            logger.info(f"Loading teacher from {teacher_config.checkpoint_path}")
+            teacher_mgr = ocp.CheckpointManager(
+                teacher_config.checkpoint_path,
+                options=ocp.CheckpointManagerOptions(create=False),
+            )
+            teacher_empty_state = TrainingState.new_from_config(
+                model_config=teacher_model_config,
+                training_config=self._config.training,
+            )
+            restored_teacher_state = teacher_mgr.restore(
+                None, args=ocp.args.PyTreeRestore(teacher_empty_state)
+            )
+            assert isinstance(restored_teacher_state, TrainingState)
+            self._teacher_model_state = (
+                restored_teacher_state.jit_state.model_state
+            )
+
+            teacher_graphdef, _ = nnx.split(
+                LczeroModel(config=teacher_model_config, rngs=nnx.Rngs(params=42))
+            )
+
         logger.info("Creating training session")
-        loss_fn = LczeroLoss(config=self._config.training.losses)
+        loss_fn = LczeroLoss(
+            config=self._config.training.losses,
+            teacher_config=(
+                self._config.training.teacher
+                if self._config.training.HasField("teacher")
+                else None
+            ),
+        )
         self._training = Training(
             optimizer_tx=make_gradient_transformation(
                 self._config.training.optimizer,
@@ -183,6 +227,7 @@ class TrainingPipeline:
                 if self._config.training.HasField("swa")
                 else None
             ),
+            teacher_graphdef=teacher_graphdef,
         )
 
         logger.info("Creating data loader")
@@ -328,6 +373,7 @@ class TrainingPipeline:
             datagen=from_dataloader(self._data_loader),
             num_steps=self._schedule.steps_per_network,
             step_hook=self._step_hook,
+            teacher_model_state=self._teacher_model_state,
         )
         self._training_state = self._training_state.replace(
             jit_state=new_jit_state

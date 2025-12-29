@@ -161,6 +161,28 @@ training {
     value { head_name: "winner" weight: 1.0 }
     movesleft { head_name: "main" weight: 1.0 }
   }
+  teacher {
+    checkpoint_path: "/path/to/teacher/checkpoint"
+    kd_alpha: 0.5       # Weight of the distillation loss
+    temperature: 2.0    # Softmax temperature for soft targets
+    model {
+      defaults {
+        compute_dtype: F32
+        activation: ACTIVATION_MISH
+        ffn_activation: ACTIVATION_MISH
+      }
+      embedding { dense_size: 256 embedding_size: 512 dff: 768 }
+      encoder {
+        num_blocks: 10
+        dff: 768
+        d_model: 512
+        heads: 16
+      }
+      policy_head { name: "vanilla" embedding_size: 512 d_model: 512 }
+      value_head { name: "winner" num_channels: 64 }
+      movesleft_head { name: "main" num_channels: 16 }
+    }
+  }
 }
 metrics {
   tensorboard_path: "/tmp/tensorboard/myrun"

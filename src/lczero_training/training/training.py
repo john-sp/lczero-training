@@ -51,7 +51,12 @@ def from_dataloader(
 class Training:
     optimizer_tx: optax.GradientTransformation
     train_step: Callable[
-        [optax.GradientTransformation, JitTrainingState, TrainingBatch],
+        [
+            optax.GradientTransformation,
+            JitTrainingState,
+            TrainingBatch,
+            Optional[nnx.State],
+        ],
         Tuple[JitTrainingState, MetricsDict],
     ]
     _swa_config: Optional[training_config_pb2.SWAConfig]
@@ -63,6 +68,7 @@ class Training:
         graphdef: nnx.GraphDef,
         loss_fn: LczeroLoss,
         swa_config: Optional[training_config_pb2.SWAConfig] = None,
+        teacher_graphdef: Optional[nnx.GraphDef] = None,
     ):
         self.optimizer_tx = optimizer_tx
         self._swa_config = swa_config
@@ -84,7 +90,8 @@ class Training:
                 probabilities=dp_sharding,
                 values=dp_sharding,
             )
-            in_shardings = (replicated, batch_sharding)
+            # optimizer_tx, jit_state, batch, teacher_model_state
+            in_shardings = (replicated, replicated, batch_sharding, replicated)
             out_shardings = replicated
 
             jit_kwargs["in_shardings"] = in_shardings
@@ -95,34 +102,48 @@ class Training:
             optimizer_tx: optax.GradientTransformation,
             jit_state: JitTrainingState,
             batch: TrainingBatch,
+            teacher_model_state: Optional[nnx.State] = None,
         ) -> Tuple[JitTrainingState, MetricsDict]:
             model = nnx.merge(graphdef, jit_state.model_state)
+            teacher_model = (
+                nnx.merge(teacher_graphdef, teacher_model_state)
+                if teacher_graphdef is not None
+                and teacher_model_state is not None
+                else None
+            )
 
             def loss_for_grad(
-                model_arg: LczeroModel, sample_arg: TrainingSample
+                model_arg: LczeroModel,
+                sample_arg: TrainingSample,
+                teacher_model_arg: Optional[LczeroModel] = None,
             ) -> Tuple[jax.Array, Dict[str, jax.Array]]:
-                return loss_fn(model_arg, sample_arg)
+                return loss_fn(model_arg, sample_arg, teacher_model_arg)
 
             loss_vfn = jax.vmap(
                 loss_for_grad,
-                in_axes=(None, 0),  # (model_arg, sample_arg)
+                in_axes=(None, 0, None),  # (model_arg, sample_arg, teacher_model_arg)
                 out_axes=0,
             )
 
             def mean_loss_for_grad(
-                model_arg: LczeroModel, batch_arg: TrainingBatch
+                model_arg: LczeroModel,
+                batch_arg: TrainingBatch,
+                teacher_model_arg: Optional[LczeroModel] = None,
             ) -> Tuple[jax.Array, Dict[str, jax.Array]]:
                 # vmap automatically distributes TrainingBatch over batch dimension,
                 # calling loss_for_grad with TrainingSample (single samples).
                 per_sample_data_loss, unweighted_losses = loss_vfn(
                     model_arg,
                     batch_arg,  # type: ignore[arg-type]
+                    teacher_model_arg,
                 )
                 mean_loss = jnp.mean(per_sample_data_loss)
                 return mean_loss, unweighted_losses
 
             grad_fn = nnx.value_and_grad(mean_loss_for_grad, has_aux=True)
-            (mean_loss, unweighted_losses), mean_grads = grad_fn(model, batch)
+            (mean_loss, unweighted_losses), mean_grads = grad_fn(
+                model, batch, teacher_model
+            )
             grad_norm = optax.global_norm(mean_grads)
 
             assert jit_state.opt_state is not None
@@ -281,13 +302,14 @@ class Training:
         datagen: Generator[tuple[np.ndarray, ...], None, None],
         num_steps: int,
         step_hook: Optional[StepHook] = None,
+        teacher_model_state: Optional[nnx.State] = None,
     ) -> JitTrainingState:
         assert jit_state.opt_state is not None
         for local_step in range(num_steps):
             logger.info(f"Starting step {jit_state.step}")
             batch = self._validate_and_prepare_batch(next(datagen))
             jit_state, metrics = self.train_step(
-                self.optimizer_tx, jit_state, batch
+                self.optimizer_tx, jit_state, batch, teacher_model_state
             )
             step_value = int(
                 np.asarray(jax.device_get(jit_state.step)).reshape(())

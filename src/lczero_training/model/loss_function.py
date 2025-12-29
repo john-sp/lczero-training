@@ -13,6 +13,7 @@ from proto.training_config_pb2 import (
     MovesLeftLossConfig,
     PolicyLossConfig,
     RegularizationLossConfig,
+    TeacherConfig,
     ValueCategoricalLossConfig,
     ValueErrorLossConfig,
     ValueLossConfig,
@@ -79,8 +80,13 @@ class LczeroLoss:
     value_categorical_losses: List["ValueCategoricalLoss"]
     regularization_losses: List["RegularizationLoss"]
 
-    def __init__(self, config: LossConfig) -> None:
+    def __init__(
+        self,
+        config: LossConfig,
+        teacher_config: Optional[TeacherConfig] = None,
+    ) -> None:
         self.config = config
+        self.teacher_config = teacher_config
         self.policy_losses = [
             PolicyLoss(loss_config) for loss_config in config.policy
         ]
@@ -129,6 +135,7 @@ class LczeroLoss:
         self,
         model: LczeroModel,
         sample: TrainingSample,
+        teacher_model: Optional[LczeroModel] = None,
     ) -> Tuple[jax.Array, Dict[str, jax.Array]]:
         # Run model forward pass.
         predictions = model(sample.inputs)
@@ -169,6 +176,30 @@ class LczeroLoss:
             loss = reg_loss(model)
             unweighted_losses[f"regularization/{reg_loss.metric_name}"] = loss
             weighted_losses.append(loss * reg_loss.weight)
+
+        if teacher_model is not None and self.teacher_config is not None:
+            teacher_predictions = teacher_model(sample.inputs)
+            kd_alpha = self.teacher_config.kd_alpha
+            temp = self.teacher_config.temperature or 1.0
+
+            for head_name, student_logits in predictions.policy.items():
+                if head_name in teacher_predictions.policy:
+                    teacher_logits = teacher_predictions.policy[head_name]
+
+                    # KL divergence for distillation
+                    # T^2 * KL(softmax(teacher_logits/T), softmax(student_logits/T))
+                    teacher_probs = jax.nn.softmax(teacher_logits / temp)
+                    teacher_probs = jax.lax.stop_gradient(teacher_probs)
+
+                    kd_loss = optax.softmax_cross_entropy(
+                        logits=student_logits / temp, labels=teacher_probs
+                    )
+
+                    # Scale by T^2 as per Hinton's distillation paper
+                    kd_loss = kd_loss * (temp * temp)
+
+                    unweighted_losses[f"kd/policy/{head_name}"] = kd_loss
+                    weighted_losses.append(kd_loss * kd_alpha)
 
         data_loss = jnp.sum(jnp.array(weighted_losses))
 
