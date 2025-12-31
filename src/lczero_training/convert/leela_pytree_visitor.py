@@ -172,9 +172,9 @@ class LeelaPytreeWeightsVisitor:
         biases: Optional[net_pb2.Weights.Layer],
     ) -> None:
         self.tensor(nnx_dict["kernel"], weights)
-        if biases:
+        if biases and "bias" in nnx_dict:
             self.tensor(nnx_dict["bias"], biases)
-        else:
+        elif not biases:
             assert "bias" not in nnx_dict
 
     def tensor(

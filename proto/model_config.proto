@@ -39,6 +39,9 @@ message EncoderConfig {
   optional uint32 d_model = 5;
   optional uint32 heads = 6;
   optional SmolgenConfig smolgen = 9;
+  optional bool use_bias_q = 10 [default = true];
+  optional bool use_bias_k = 11 [default = true];
+  optional bool use_bias_v = 12 [default = true];
 }
 
 message SmolgenConfig {
@@ -46,6 +49,8 @@ message SmolgenConfig {
   optional uint32 hidden_size = 2;
   optional uint32 gen_size = 3;
   optional pblczero.NetworkFormat.ActivationFunction activation = 5;
+  optional bool use_bias_dense1 = 6 [default = true];
+  optional bool use_bias_dense2 = 7 [default = true];
 }
 
 message PolicyHeadConfig {
