@@ -113,10 +113,16 @@ class MultiHeadAttention(nnx.Module):
         self.depth = depth
         self.num_heads = config.heads
         self.q = nnx.Linear(
-            in_features=in_features, out_features=depth, rngs=rngs
+            in_features=in_features,
+            out_features=depth,
+            use_bias=config.use_bias_q,
+            rngs=rngs,
         )
         self.k = nnx.Linear(
-            in_features=in_features, out_features=depth, rngs=rngs
+            in_features=in_features,
+            out_features=depth,
+            use_bias=config.use_bias_k,
+            rngs=rngs,
         )
         deepnorm_init = flax_initializers.variance_scaling(
             scale=deepnorm_beta,
@@ -127,6 +133,7 @@ class MultiHeadAttention(nnx.Module):
         self.v = nnx.Linear(
             in_features=in_features,
             out_features=depth,
+            use_bias=config.use_bias_v,
             kernel_init=deepnorm_init,
             rngs=rngs,
         )
@@ -200,6 +207,7 @@ class Smolgen(nnx.Module):
         self.dense1 = nnx.Linear(
             in_features=config.hidden_channels * 64,
             out_features=config.hidden_size,
+            use_bias=config.use_bias_dense1,
             rngs=rngs,
         )
         self.ln1 = norm_layer(config.hidden_size, epsilon=1e-3, rngs=rngs)
@@ -207,6 +215,7 @@ class Smolgen(nnx.Module):
         self.dense2 = nnx.Linear(
             in_features=config.hidden_size,
             out_features=config.gen_size * heads,
+            use_bias=config.use_bias_dense2,
             rngs=rngs,
         )
         self.ln2 = norm_layer(

@@ -102,11 +102,16 @@ model {
     dff: 1536
     d_model: 1024
     heads: 32
+    use_bias_q: false
+    use_bias_k: false
+    use_bias_v: false
     smolgen {
       hidden_channels: 32
       hidden_size: 256
       gen_size: 256
       activation: ACTIVATION_SWISH
+      use_bias_dense1: true
+      use_bias_dense2: true
     }
   }
   policy_head { name: "vanilla" embedding_size: 1024 d_model: 1024 }
