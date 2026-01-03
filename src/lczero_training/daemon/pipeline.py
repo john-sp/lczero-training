@@ -6,7 +6,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import cast
+from typing import Optional, cast
 
 import jax
 import orbax.checkpoint as ocp
