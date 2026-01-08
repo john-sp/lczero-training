@@ -112,6 +112,12 @@ class MultiHeadAttention(nnx.Module):
         self.activation = defaults.activation
         self.depth = depth
         self.num_heads = config.heads
+        self.kv_heads = (
+            config.kv_heads if config.HasField("kv_heads") else config.heads
+        )
+        assert self.num_heads % self.kv_heads == 0
+        head_depth = depth // self.num_heads
+
         self.q = nnx.Linear(
             in_features=in_features,
             out_features=depth,
@@ -120,7 +126,7 @@ class MultiHeadAttention(nnx.Module):
         )
         self.k = nnx.Linear(
             in_features=in_features,
-            out_features=depth,
+            out_features=self.kv_heads * head_depth,
             use_bias=config.use_bias_k,
             rngs=rngs,
         )
@@ -132,7 +138,7 @@ class MultiHeadAttention(nnx.Module):
 
         self.v = nnx.Linear(
             in_features=in_features,
-            out_features=depth,
+            out_features=self.kv_heads * head_depth,
             use_bias=config.use_bias_v,
             kernel_init=deepnorm_init,
             rngs=rngs,
@@ -161,10 +167,14 @@ class MultiHeadAttention(nnx.Module):
 
         head_depth = self.depth // self.num_heads
         # Reshape for multi-head attention.
-        q, k, v = (
-            t.reshape((-1, self.num_heads, head_depth)).transpose((1, 0, 2))
-            for t in (q, k, v)
-        )
+        q = q.reshape((-1, self.num_heads, head_depth)).transpose((1, 0, 2))
+        k = k.reshape((-1, self.kv_heads, head_depth)).transpose((1, 0, 2))
+        v = v.reshape((-1, self.kv_heads, head_depth)).transpose((1, 0, 2))
+
+        if self.kv_heads != self.num_heads:
+            group_size = self.num_heads // self.kv_heads
+            k = jnp.repeat(k, group_size, axis=0)
+            v = jnp.repeat(v, group_size, axis=0)
 
         # Scaled dot-product attention.
         logits = jnp.einsum("...qd,...kd->...qk", q, k)
