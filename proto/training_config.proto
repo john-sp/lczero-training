@@ -37,6 +37,7 @@ message OptimizerConfig {
     NadamwOptimizerConfig nadamw = 1;
     NadamOptimizerConfig nadam = 2;
     SgdOptimizerConfig sgd = 3;
+    MuonOptimizerConfig muon = 4;
   }
 }
 
@@ -58,6 +59,20 @@ message LrSchedule {
   repeated Transition transition = 4;
   // When true this schedule loops after finishing the final interval.
   bool loop = 5;
+}
+
+message MuonOptimizerConfig {
+  int32 ns_steps = 1;
+  float beta = 2;
+  float epsilon = 3;
+  float weight_decay = 4;
+  bool nesterov = 5;
+  bool adaptive = 6;
+  float adam_beta_1 = 7;
+  float adam_beta_2 = 8;
+  float adam_epsilon_root = 9;
+  float adam_weight_decay = 10;
+  WeightsSelector decay_selector = 11;
 }
 
 message NadamwOptimizerConfig {
