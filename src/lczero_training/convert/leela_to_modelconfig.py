@@ -75,6 +75,9 @@ def leela_to_modelconfig(
     assert model_config.encoder.num_blocks > 0
     encoder = weights.encoder[0]
     
+    if not encoder.HasField("ln1_betas"):
+        model_config.defaults.norm_type = model_config_pb2.NORM_RMS_NORM
+    
     if encoder.mha.HasField("q_b"):
         model_config.encoder.d_model = size(encoder.mha.q_b)
         model_config.encoder.use_bias_q = True
