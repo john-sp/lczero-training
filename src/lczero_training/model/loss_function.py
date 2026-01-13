@@ -179,11 +179,27 @@ class LczeroLoss:
 
         if teacher_model is not None and self.teacher_config is not None:
             teacher_predictions = teacher_model(sample.inputs)
-            kd_alpha = self.teacher_config.kd_alpha
-            temp = self.teacher_config.temperature or 1.0
+            global_kd_alpha = self.teacher_config.kd_alpha
+            global_temp = self.teacher_config.temperature or 1.0
+
+            # Map head_name -> TeacherPolicyConfig
+            policy_map = {p.head_name: p for p in self.teacher_config.policy}
 
             for head_name, student_logits in predictions.policy.items():
                 if head_name in teacher_predictions.policy:
+                    # Determine parameters for this head.
+                    kd_alpha = global_kd_alpha
+                    temp = global_temp
+
+                    if head_name in policy_map:
+                        cfg = policy_map[head_name]
+                        kd_alpha = cfg.kd_alpha
+                        if cfg.temperature > 0:
+                            temp = cfg.temperature
+
+                    if kd_alpha == 0:
+                        continue
+
                     teacher_logits = teacher_predictions.policy[head_name]
 
                     # KL divergence for distillation
