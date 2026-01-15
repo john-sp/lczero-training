@@ -143,12 +143,18 @@ message ShufflingFrameSamplerConfig {
 // Configuration for tensor generator that converts frames to batched tensors.
 // Maps to TensorGeneratorOptions in csrc/loader/tensor_generator.h
 message TensorGeneratorConfig {
+  enum InputPlaneFormat {
+    INPUT_PLANE_FORMAT_LEGACY = 0;
+    INPUT_PLANE_FORMAT_DN1 = 1;
+  }
   // Number of worker threads for tensor generation.
   optional uint64 threads = 1 [default = 1];
   // Batch size for tensor generation.
   optional uint64 batch_size = 2 [default = 1024];
   // Output queue configuration.
   optional QueueConfig output = 3;
+  // Input plane semantics for planes 91-103.
+  optional InputPlaneFormat input_plane_format = 4;
 }
 
 // Configuration for a stage that splits incoming ChunkSources into several

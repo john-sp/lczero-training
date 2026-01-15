@@ -3,28 +3,360 @@
 
 #include "loader/stages/tensor_generator.h"
 
+#include <array>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
 #include "absl/algorithm/container.h"
 #include "absl/log/log.h"
+#include "absl/types/span.h"
+#include "chess/board.h"
+#include "chess/bitboard.h"
+#include "chess/types.h"
 #include "loader/data_loader_metrics.h"
+#include "neural/decoder.h"
 #include "proto/data_loader_config.pb.h"
 #include "proto/training_metrics.pb.h"
+#include "trainingdata/reader.h"
+#include "utils/bititer.h"
+#include "utils/exception.h"
 
 namespace lczero {
 namespace training {
+
+namespace {
+
+constexpr int kDn1ControlPlusPlane = 91;
+constexpr int kDn1ControlEqualPlane = 92;
+constexpr int kDn1ControlMinusPlane = 93;
+constexpr int kDn1OurPinsPlane = 94;
+constexpr int kDn1TheirPinsPlane = 95;
+constexpr int kDn1OurHangingPlane = 96;
+constexpr int kDn1TheirHangingPlane = 97;
+constexpr int kDn1OurPassedPawnsPlane = 98;
+constexpr int kDn1TheirPassedPawnsPlane = 99;
+constexpr int kDn1LegalChecksPlane = 100;
+constexpr int kDn1UnimplementedFirstPlane = 101;
+constexpr int kDn1UnimplementedLastPlane = 103;
+
+Square SingleSquare(BitBoard input) {
+  for (auto sq : input) {
+    return sq;
+  }
+  assert(false);
+  return Square();
+}
+
+InputPlanes PlanesFromTrainingDataNoTransform(const FrameType& data) {
+  InputPlanes result;
+  result.reserve(112);
+  for (int i = 0; i < 104; ++i) {
+    result.emplace_back();
+    result.back().mask = ReverseBitsInBytes(data.planes[i]);
+  }
+  switch (data.input_format) {
+    case pblczero::NetworkFormat::INPUT_CLASSICAL_112_PLANE: {
+      result.emplace_back();
+      result.back().mask = data.castling_us_ooo != 0 ? ~0LL : 0LL;
+      result.emplace_back();
+      result.back().mask = data.castling_us_oo != 0 ? ~0LL : 0LL;
+      result.emplace_back();
+      result.back().mask = data.castling_them_ooo != 0 ? ~0LL : 0LL;
+      result.emplace_back();
+      result.back().mask = data.castling_them_oo != 0 ? ~0LL : 0LL;
+      break;
+    }
+    case pblczero::NetworkFormat::INPUT_112_WITH_CASTLING_PLANE:
+    case pblczero::NetworkFormat::INPUT_112_WITH_CANONICALIZATION:
+    case pblczero::NetworkFormat::INPUT_112_WITH_CANONICALIZATION_HECTOPLIES:
+    case pblczero::NetworkFormat::
+        INPUT_112_WITH_CANONICALIZATION_HECTOPLIES_ARMAGEDDON:
+    case pblczero::NetworkFormat::INPUT_112_WITH_CANONICALIZATION_V2:
+    case pblczero::NetworkFormat::
+        INPUT_112_WITH_CANONICALIZATION_V2_ARMAGEDDON: {
+      result.emplace_back();
+      result.back().mask =
+          data.castling_us_ooo |
+          (static_cast<uint64_t>(data.castling_them_ooo) << 56);
+      result.emplace_back();
+      result.back().mask = data.castling_us_oo |
+                           (static_cast<uint64_t>(data.castling_them_oo)
+                            << 56);
+      result.emplace_back();
+      result.emplace_back();
+      break;
+    }
+    default:
+      throw Exception("Unsupported input plane encoding " +
+                      std::to_string(data.input_format));
+  }
+  result.emplace_back();
+  auto typed_format =
+      static_cast<pblczero::NetworkFormat::InputFormat>(data.input_format);
+  if (IsCanonicalFormat(typed_format)) {
+    result.back().mask = static_cast<uint64_t>(data.side_to_move_or_enpassant)
+                         << 56;
+  } else {
+    result.back().mask = data.side_to_move_or_enpassant != 0 ? ~0LL : 0LL;
+  }
+  result.emplace_back();
+  if (IsHectopliesFormat(typed_format)) {
+    result.back().Fill(data.rule50_count / 100.0f);
+  } else {
+    result.back().Fill(data.rule50_count);
+  }
+  result.emplace_back();
+  if (IsCanonicalArmageddonFormat(typed_format) &&
+      data.invariance_info >= 128) {
+    result.back().SetAll();
+  }
+  result.emplace_back();
+  result.back().SetAll();
+  return result;
+}
+
+constexpr bool IsOnBoard(int file, int rank) {
+  return file >= 0 && file < 8 && rank >= 0 && rank < 8;
+}
+
+void AddAttack(std::array<uint8_t, 64>& counts, Square square) {
+  const auto idx = square.as_idx();
+  if (counts[idx] < 255) ++counts[idx];
+}
+
+void AddSlidingAttacks(std::array<uint8_t, 64>& counts, Square square,
+                       absl::Span<const std::pair<int, int>> directions,
+                       const BitBoard& occupancy) {
+  int file = square.file().idx;
+  int rank = square.rank().idx;
+  for (const auto& [df, dr] : directions) {
+    int f = file + df;
+    int r = rank + dr;
+    while (IsOnBoard(f, r)) {
+      Square target(File::FromIdx(f), Rank::FromIdx(r));
+      AddAttack(counts, target);
+      if (occupancy.get(target)) break;
+      f += df;
+      r += dr;
+    }
+  }
+}
+
+std::array<uint8_t, 64> ComputeAttackCounts(const ChessBoard& board,
+                                            const BitBoard& side_pieces,
+                                            bool side_is_ours) {
+  std::array<uint8_t, 64> counts{};
+  const BitBoard occupancy = board.ours() | board.theirs();
+
+  const BitBoard pawns = board.pawns() & side_pieces;
+  const BitBoard knights = board.knights() & side_pieces;
+  const BitBoard bishops = board.bishops() & side_pieces;
+  const BitBoard rooks = board.rooks() & side_pieces;
+  const BitBoard queens = board.queens() & side_pieces;
+  const BitBoard kings = board.kings() & side_pieces;
+
+  const int pawn_dir = side_is_ours ? 1 : -1;
+  for (auto square : pawns) {
+    const int file = square.file().idx;
+    const int rank = square.rank().idx + pawn_dir;
+    if (!IsOnBoard(file, rank)) continue;
+    if (file > 0) {
+      AddAttack(counts, Square(File::FromIdx(file - 1), Rank::FromIdx(rank)));
+    }
+    if (file < 7) {
+      AddAttack(counts, Square(File::FromIdx(file + 1), Rank::FromIdx(rank)));
+    }
+  }
+
+  static constexpr std::array<std::pair<int, int>, 8> kKnightDeltas = {
+      std::pair<int, int>{-2, -1}, {-2, 1}, {-1, -2}, {-1, 2},
+      {1, -2}, {1, 2}, {2, -1}, {2, 1}};
+  for (auto square : knights) {
+    const int file = square.file().idx;
+    const int rank = square.rank().idx;
+    for (const auto& [df, dr] : kKnightDeltas) {
+      const int f = file + df;
+      const int r = rank + dr;
+      if (!IsOnBoard(f, r)) continue;
+      AddAttack(counts, Square(File::FromIdx(f), Rank::FromIdx(r)));
+    }
+  }
+
+  static constexpr std::array<std::pair<int, int>, 8> kKingDeltas = {
+      std::pair<int, int>{-1, -1}, {-1, 0}, {-1, 1}, {0, -1},
+      {0, 1}, {1, -1}, {1, 0}, {1, 1}};
+  for (auto square : kings) {
+    const int file = square.file().idx;
+    const int rank = square.rank().idx;
+    for (const auto& [df, dr] : kKingDeltas) {
+      const int f = file + df;
+      const int r = rank + dr;
+      if (!IsOnBoard(f, r)) continue;
+      AddAttack(counts, Square(File::FromIdx(f), Rank::FromIdx(r)));
+    }
+  }
+
+  static constexpr std::array<std::pair<int, int>, 4> kBishopDirs = {
+      std::pair<int, int>{1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
+  static constexpr std::array<std::pair<int, int>, 4> kRookDirs = {
+      std::pair<int, int>{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+  static constexpr std::array<std::pair<int, int>, 8> kQueenDirs = {
+      std::pair<int, int>{1, 0},  {-1, 0}, {0, 1},  {0, -1},
+      {1, 1},  {1, -1}, {-1, 1}, {-1, -1}};
+
+  for (auto square : bishops) {
+    AddSlidingAttacks(counts, square, kBishopDirs, occupancy);
+  }
+  for (auto square : rooks) {
+    AddSlidingAttacks(counts, square, kRookDirs, occupancy);
+  }
+  for (auto square : queens) {
+    AddSlidingAttacks(counts, square, kQueenDirs, occupancy);
+  }
+
+  return counts;
+}
+
+bool IsPassedPawn(const BitBoard& enemy_pawns, Square pawn,
+                  bool pawn_is_ours) {
+  const int pawn_file = pawn.file().idx;
+  const int pawn_rank = pawn.rank().idx;
+  for (auto enemy : enemy_pawns) {
+    const int enemy_file = enemy.file().idx;
+    if (std::abs(enemy_file - pawn_file) > 1) continue;
+    const int enemy_rank = enemy.rank().idx;
+    if (pawn_is_ours && enemy_rank > pawn_rank) return false;
+    if (!pawn_is_ours && enemy_rank < pawn_rank) return false;
+  }
+  return true;
+}
+
+bool IsSquareAttackedByUs(const ChessBoard& board, Square square) {
+  ChessBoard mirrored = board;
+  mirrored.Mirror();
+  Square mirrored_square = square;
+  mirrored_square.Flip();
+  return mirrored.IsUnderAttack(mirrored_square);
+}
+
+struct Dn1Planes {
+  BitBoard control_plus{0};
+  BitBoard control_equal{0};
+  BitBoard control_minus{0};
+  BitBoard our_pins{0};
+  BitBoard their_pins{0};
+  BitBoard our_hanging{0};
+  BitBoard their_hanging{0};
+  BitBoard our_passed_pawns{0};
+  BitBoard their_passed_pawns{0};
+  BitBoard legal_checks{0};
+};
+
+Dn1Planes ComputeDn1Planes(const FrameType& frame) {
+  const auto input_format =
+      static_cast<pblczero::NetworkFormat::InputFormat>(frame.input_format);
+  InputPlanes planes = PlanesFromTrainingDataNoTransform(frame);
+  ChessBoard board;
+  int rule50 = 0;
+  int gameply = 0;
+  PopulateBoard(input_format, planes, &board, &rule50, &gameply);
+
+  const BitBoard our_pieces = board.ours();
+  const BitBoard their_pieces = board.theirs();
+  const BitBoard our_king = board.kings() & our_pieces;
+  const BitBoard their_king = board.kings() & their_pieces;
+
+  const auto our_attacks = ComputeAttackCounts(board, our_pieces, true);
+  const auto their_attacks = ComputeAttackCounts(board, their_pieces, false);
+
+  Dn1Planes out;
+
+  for (auto square : (our_pieces | their_pieces)) {
+    const int idx = square.as_idx();
+    const int our_count = our_attacks[idx];
+    const int their_count = their_attacks[idx];
+    if (our_count == 0 || their_count == 0) continue;
+    if (our_count > their_count) {
+      out.control_plus.set(square);
+    } else if (our_count == their_count) {
+      out.control_equal.set(square);
+    } else {
+      out.control_minus.set(square);
+    }
+  }
+
+  out.our_pins = board.GenerateKingAttackInfo().pinned_pieces_;
+
+  {
+    ChessBoard mirrored = board;
+    mirrored.Mirror();
+    out.their_pins = mirrored.GenerateKingAttackInfo().pinned_pieces_;
+    out.their_pins.Mirror();
+  }
+
+  for (auto square : our_pieces) {
+    if (our_king.get(square)) continue;
+    if (our_attacks[square.as_idx()] == 0) out.our_hanging.set(square);
+  }
+  for (auto square : their_pieces) {
+    if (their_king.get(square)) continue;
+    if (their_attacks[square.as_idx()] == 0) out.their_hanging.set(square);
+  }
+
+  const BitBoard our_pawns = board.pawns() & our_pieces;
+  const BitBoard their_pawns = board.pawns() & their_pieces;
+  for (auto square : our_pawns) {
+    if (IsPassedPawn(their_pawns, square, true)) {
+      out.our_passed_pawns.set(square);
+    }
+  }
+  for (auto square : their_pawns) {
+    if (IsPassedPawn(our_pawns, square, false)) {
+      out.their_passed_pawns.set(square);
+    }
+  }
+
+  const MoveList legal_moves = board.GenerateLegalMoves();
+  for (const auto& move : legal_moves) {
+    ChessBoard copy = board;
+    copy.ApplyMove(move);
+    const Square opponent_king = SingleSquare(copy.kings() & copy.theirs());
+    if (IsSquareAttackedByUs(copy, opponent_king)) {
+      out.legal_checks.set(move.to());
+    }
+  }
+
+  return out;
+}
+
+void FillPlaneSliceFromBitboard(absl::Span<float> plane_slice,
+                                const BitBoard& board) {
+  const uint64_t bits = board.as_int();
+  for (ssize_t square = 0; square < 64; ++square) {
+    plane_slice[square] = static_cast<float>((bits >> (square ^ 7)) & 1);
+  }
+}
+
+}  // namespace
 
 TensorGenerator::TensorGenerator(const TensorGeneratorConfig& config)
     : SingleInputStage<TensorGeneratorConfig, InputType>(config),
       SingleOutputStage<OutputType>(config.output()),
       batch_size_(config.batch_size()),
+      input_plane_format_(config.input_plane_format()),
       thread_pool_(config.threads(), ThreadPoolOptions{}) {
   LOG(INFO) << "Initializing TensorGenerator with " << config.threads()
             << " threads, batch size " << config.batch_size();
+  if (input_plane_format_ !=
+      TensorGeneratorConfig::INPUT_PLANE_FORMAT_LEGACY) {
+    LOG(INFO) << "TensorGenerator input plane format set to "
+              << input_plane_format_ << ".";
+  }
 
   // Initialize thread contexts but don't start worker threads yet.
   thread_contexts_.reserve(config.threads());
@@ -167,12 +499,66 @@ void TensorGenerator::ProcessPlanes(const std::vector<FrameType>& frames,
     const auto& frame = frames[i];
     auto batch_slice = planes_tensor.slice({static_cast<ssize_t>(i)});
 
+    std::optional<Dn1Planes> dn1_planes;
+    if (input_plane_format_ ==
+        TensorGeneratorConfig::INPUT_PLANE_FORMAT_DN1) {
+      dn1_planes = ComputeDn1Planes(frame);
+    }
+
     // Process first 104 planes from frame.planes (each uint64_t represents 64
     // bits).
     for (ssize_t plane = 0; plane < 104; ++plane) {
       auto plane_slice = batch_slice.subspan(plane * 64, 64);
-      uint64_t plane_bits = frame.planes[plane];
+      if (dn1_planes.has_value()) {
+        const Dn1Planes& dn1 = *dn1_planes;
+        if (plane == kDn1ControlPlusPlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.control_plus);
+          continue;
+        }
+        if (plane == kDn1ControlEqualPlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.control_equal);
+          continue;
+        }
+        if (plane == kDn1ControlMinusPlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.control_minus);
+          continue;
+        }
+        if (plane == kDn1OurPinsPlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.our_pins);
+          continue;
+        }
+        if (plane == kDn1TheirPinsPlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.their_pins);
+          continue;
+        }
+        if (plane == kDn1OurHangingPlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.our_hanging);
+          continue;
+        }
+        if (plane == kDn1TheirHangingPlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.their_hanging);
+          continue;
+        }
+        if (plane == kDn1OurPassedPawnsPlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.our_passed_pawns);
+          continue;
+        }
+        if (plane == kDn1TheirPassedPawnsPlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.their_passed_pawns);
+          continue;
+        }
+        if (plane == kDn1LegalChecksPlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.legal_checks);
+          continue;
+        }
+        if (plane >= kDn1UnimplementedFirstPlane &&
+            plane <= kDn1UnimplementedLastPlane) {
+          absl::c_fill(plane_slice, 0.0f);
+          continue;
+        }
+      }
 
+      uint64_t plane_bits = frame.planes[plane];
       for (ssize_t square = 0; square < 64; ++square) {
         // XOR with 7 remaps the index within each byte from 0..7 to 7..0.
         plane_slice[square] =
