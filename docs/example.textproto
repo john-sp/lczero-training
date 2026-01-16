@@ -105,6 +105,7 @@ model {
     use_bias_q: false
     use_bias_k: false
     use_bias_v: false
+    use_q_gate: false
     smolgen {
       hidden_channels: 32
       hidden_size: 256

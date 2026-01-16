@@ -124,6 +124,9 @@ class MultiHeadAttention(nnx.Module):
             use_bias=config.use_bias_q,
             rngs=rngs,
         )
+        self.q_gate = None
+        if config.use_q_gate:
+            self.q_gate = nnx.Param(jnp.array(1.0, dtype=jnp.float32))
         self.k = nnx.Linear(
             in_features=in_features,
             out_features=self.kv_heads * head_depth,
@@ -164,6 +167,8 @@ class MultiHeadAttention(nnx.Module):
 
     def __call__(self, x: jax.Array) -> jax.Array:
         q, k, v = self.q(x), self.k(x), self.v(x)
+        if self.q_gate is not None:
+            q = q * self.q_gate.value.astype(q.dtype)
 
         head_depth = self.depth // self.num_heads
         # Reshape for multi-head attention.

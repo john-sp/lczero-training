@@ -90,6 +90,7 @@ def leela_to_modelconfig(
 
     model_config.encoder.use_bias_k = encoder.mha.HasField("k_b")
     model_config.encoder.use_bias_v = encoder.mha.HasField("v_b")
+    model_config.encoder.use_q_gate = encoder.mha.HasField("q_gate")
 
     if encoder.mha.HasField("k_b"):
         model_config.encoder.kv_heads = size(encoder.mha.k_b) // head_depth
