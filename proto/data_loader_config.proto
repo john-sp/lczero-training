@@ -146,6 +146,7 @@ message TensorGeneratorConfig {
   enum InputPlaneFormat {
     INPUT_PLANE_FORMAT_LEGACY = 0;
     INPUT_PLANE_FORMAT_DN1 = 1;
+    INPUT_PLANE_FORMAT_ZEROED = 2;
   }
   // Number of worker threads for tensor generation.
   optional uint64 threads = 1 [default = 1];

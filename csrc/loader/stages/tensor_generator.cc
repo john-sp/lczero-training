@@ -523,9 +523,13 @@ void TensorGenerator::ProcessPlanes(const std::vector<FrameType>& frames,
       absl::c_fill(plane_slice, value);
     }
 
+    const bool zero_geometric_planes =
+        input_plane_format_ ==
+        TensorGeneratorConfig::INPUT_PLANE_FORMAT_ZEROED;
     std::optional<Dn1Planes> dn1_planes;
-    if (input_plane_format_ ==
-        TensorGeneratorConfig::INPUT_PLANE_FORMAT_DN1) {
+    if (!zero_geometric_planes &&
+        input_plane_format_ ==
+            TensorGeneratorConfig::INPUT_PLANE_FORMAT_DN1) {
       dn1_planes = ComputeDn1Planes(frame);
     }
 
@@ -533,6 +537,11 @@ void TensorGenerator::ProcessPlanes(const std::vector<FrameType>& frames,
     // bits).
     for (ssize_t plane = 0; plane < 104; ++plane) {
       auto plane_slice = batch_slice.subspan(plane * 64, 64);
+      if (zero_geometric_planes && plane >= kDn1ControlPlusPlane &&
+          plane <= kDn1UnimplementedLastPlane) {
+        absl::c_fill(plane_slice, 0.0f);
+        continue;
+      }
       if (dn1_planes.has_value()) {
         const Dn1Planes& dn1 = *dn1_planes;
         if (plane == kDn1ControlPlusPlane) {
