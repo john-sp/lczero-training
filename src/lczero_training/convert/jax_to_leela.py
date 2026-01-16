@@ -110,7 +110,10 @@ def _make_format(model_config: model_config_pb2.ModelConfig) -> net_pb2.Format:
     fmt = net_pb2.Format()
     fmt.weights_encoding = fmt.LINEAR16
     netfmt = fmt.network_format
-    netfmt.input = netfmt.INPUT_CLASSICAL_112_PLANE
+    if model_config.HasField("input_format"):
+        netfmt.input = model_config.input_format
+    else:
+        netfmt.input = netfmt.INPUT_CLASSICAL_112_PLANE
     netfmt.output = netfmt.OUTPUT_WDL
     netfmt.network = netfmt.NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT
     netfmt.policy = netfmt.POLICY_ATTENTION

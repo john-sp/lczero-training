@@ -65,6 +65,7 @@ def leela_to_modelconfig(
         == net_pb2.NetworkFormat.NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT
     )
     weights = leela_net.weights
+    model_config.input_format = leela_net_format.input
     model_config.embedding.dense_size = size(weights.ip_emb_preproc_b) // 64
     model_config.embedding.embedding_size = size(weights.ip_emb_b)
     assert size(weights.ip_mult_gate) > 0

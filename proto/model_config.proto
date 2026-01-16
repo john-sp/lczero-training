@@ -18,6 +18,7 @@ message ModelConfig {
   repeated PolicyHeadConfig policy_head = 8;
   repeated ValueHeadConfig value_head = 9;
   repeated MovesLeftHeadConfig movesleft_head = 10;
+  optional pblczero.NetworkFormat.InputFormat input_format = 11;
 }
 
 message DefaultsConfig {
