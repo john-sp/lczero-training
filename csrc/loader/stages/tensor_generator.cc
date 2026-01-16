@@ -20,6 +20,7 @@
 #include "chess/types.h"
 #include "loader/data_loader_metrics.h"
 #include "neural/decoder.h"
+#include "neural/encoder.h"
 #include "proto/data_loader_config.pb.h"
 #include "proto/training_metrics.pb.h"
 #include "trainingdata/reader.h"
@@ -301,11 +302,17 @@ Dn1Planes ComputeDn1Planes(const FrameType& frame) {
 
   for (auto square : our_pieces) {
     if (our_king.get(square)) continue;
-    if (our_attacks[square.as_idx()] == 0) out.our_hanging.set(square);
+    const int idx = square.as_idx();
+    if (their_attacks[idx] > 0 && our_attacks[idx] == 0) {
+      out.our_hanging.set(square);
+    }
   }
   for (auto square : their_pieces) {
     if (their_king.get(square)) continue;
-    if (their_attacks[square.as_idx()] == 0) out.their_hanging.set(square);
+    const int idx = square.as_idx();
+    if (our_attacks[idx] > 0 && their_attacks[idx] == 0) {
+      out.their_hanging.set(square);
+    }
   }
 
   const BitBoard our_pawns = board.pawns() & our_pieces;
@@ -336,7 +343,7 @@ Dn1Planes ComputeDn1Planes(const FrameType& frame) {
 
 void FillPlaneSliceFromBitboard(absl::Span<float> plane_slice,
                                 const BitBoard& board) {
-  const uint64_t bits = board.as_int();
+  const uint64_t bits = ReverseBitsInBytes(board.as_int());
   for (ssize_t square = 0; square < 64; ++square) {
     plane_slice[square] = static_cast<float>((bits >> (square ^ 7)) & 1);
   }

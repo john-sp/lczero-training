@@ -21,11 +21,33 @@ def _stop_loader(loader: DataLoader) -> None:
 
 
 def _materialize_batch(batch: Any) -> dict:
+    if isinstance(batch, tuple):
+        if len(batch) != 3:
+            raise ValueError(
+                f"Expected tuple of 3 tensors, got {len(batch)}"
+            )
+        return {
+            "inputs": batch[0],
+            "probabilities": batch[1],
+            "values": batch[2],
+        }
+
+    expected_fields = ["inputs", "probabilities", "values"]
+    available_fields = [
+        name for name in dir(batch) if not name.startswith("_")
+    ]
+    missing_fields = [
+        name for name in expected_fields if not hasattr(batch, name)
+    ]
+    if missing_fields:
+        logger.info(
+            "Batch fields: %s",
+            ", ".join(sorted(available_fields)),
+        )
     return {
-        "input": batch.input,
-        "policy_heads": batch.policy_heads,
-        "value_heads": batch.value_heads,
-        "movesleft_heads": batch.movesleft_heads,
+        "inputs": getattr(batch, "inputs", None),
+        "probabilities": getattr(batch, "probabilities", None),
+        "values": getattr(batch, "values", None),
     }
 
 
