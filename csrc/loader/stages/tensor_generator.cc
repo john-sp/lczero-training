@@ -281,7 +281,7 @@ Dn1Planes ComputeDn1Planes(const FrameType& frame) {
     const int idx = square.as_idx();
     const int our_count = our_attacks[idx];
     const int their_count = their_attacks[idx];
-    if (our_count == 0 || their_count == 0) continue;
+    if (their_count == 0 || our_count == 0) continue;
     if (our_count > their_count) {
       out.control_plus.set(square);
     } else if (our_count == their_count) {
@@ -506,6 +506,23 @@ void TensorGenerator::ProcessPlanes(const std::vector<FrameType>& frames,
     const auto& frame = frames[i];
     auto batch_slice = planes_tensor.slice({static_cast<ssize_t>(i)});
 
+    // Add 8 additional planes for metadata (planes 104-111).
+    const std::pair<ssize_t, float> meta_planes[] = {
+        {104, static_cast<float>(frame.castling_us_ooo)},
+        {105, static_cast<float>(frame.castling_us_oo)},
+        {106, static_cast<float>(frame.castling_them_ooo)},
+        {107, static_cast<float>(frame.castling_them_oo)},
+        {108, static_cast<float>(frame.side_to_move_or_enpassant)},
+        {109, static_cast<float>(frame.rule50_count) / 99.0f},
+        {110, 0.0f},  // All zeros (constant plane).
+        {111, 1.0f},  // All ones (constant plane).
+    };
+
+    for (const auto& [plane_num, value] : meta_planes) {
+      auto plane_slice = batch_slice.subspan(plane_num * 64, 64);
+      absl::c_fill(plane_slice, value);
+    }
+
     std::optional<Dn1Planes> dn1_planes;
     if (input_plane_format_ ==
         TensorGeneratorConfig::INPUT_PLANE_FORMAT_DN1) {
@@ -571,23 +588,6 @@ void TensorGenerator::ProcessPlanes(const std::vector<FrameType>& frames,
         plane_slice[square] =
             static_cast<float>((plane_bits >> (square ^ 7)) & 1);
       }
-    }
-
-    // Add 8 additional planes for metadata (planes 104-111).
-    const std::pair<ssize_t, float> meta_planes[] = {
-        {104, static_cast<float>(frame.castling_us_ooo)},
-        {105, static_cast<float>(frame.castling_us_oo)},
-        {106, static_cast<float>(frame.castling_them_ooo)},
-        {107, static_cast<float>(frame.castling_them_oo)},
-        {108, static_cast<float>(frame.side_to_move_or_enpassant)},
-        {109, static_cast<float>(frame.rule50_count) / 99.0f},
-        {110, 0.0f},  // All zeros (constant plane).
-        {111, 1.0f},  // All ones (constant plane).
-    };
-
-    for (const auto& [plane_num, value] : meta_planes) {
-      auto plane_slice = batch_slice.subspan(plane_num * 64, 64);
-      absl::c_fill(plane_slice, value);
     }
   }
 }
