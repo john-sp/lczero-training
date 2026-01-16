@@ -135,6 +135,7 @@ files = [
   'csrc/loader/stages/stage_factory.cc',
   'csrc/loader/stages/stage.cc',
   'csrc/loader/stages/tensor_generator.cc',
+  'csrc/utils/dn1_planes.cc',
   'csrc/utils/gz.cc',
   'csrc/utils/stream_shuffler.cc',
   'csrc/utils/training_data_printer.cc',

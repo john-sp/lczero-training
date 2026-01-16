@@ -44,7 +44,7 @@ message EncoderConfig {
   optional bool use_bias_k = 11 [default = true];
   optional bool use_bias_v = 12 [default = true];
   optional uint32 kv_heads = 13;
-  optional bool use_q_gate = 14 [default = false];
+  optional bool use_q_scale = 14 [default = false];
 }
 
 message SmolgenConfig {

@@ -88,8 +88,8 @@ class LeelaPytreeWeightsVisitor:
 
     def mha(self, nnx_dict: nnx.State, weights: net_pb2.Weights.MHA) -> None:
         self.matmul(nnx_dict["q"], weights.q_w, weights.q_b)
-        if "q_gate" in nnx_dict:
-            self.tensor(nnx_dict["q_gate"], weights.q_gate)
+        if "q_scale" in nnx_dict:
+            self.tensor(nnx_dict["q_scale"], weights.q_scale)
         self.matmul(nnx_dict["k"], weights.k_w, weights.k_b)
         self.matmul(nnx_dict["v"], weights.v_w, weights.v_b)
         self.smolgen(nnx_dict["smolgen"], weights.smolgen)

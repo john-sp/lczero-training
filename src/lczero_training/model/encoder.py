@@ -124,9 +124,11 @@ class MultiHeadAttention(nnx.Module):
             use_bias=config.use_bias_q,
             rngs=rngs,
         )
-        self.q_gate = None
-        if config.use_q_gate:
-            self.q_gate = nnx.Param(jnp.array(1.0, dtype=jnp.float32))
+        self.q_scale = None
+        if config.use_q_scale:
+            self.q_scale = nnx.Param(
+                jnp.ones((self.num_heads, 1, 1), dtype=jnp.float32)
+            )
         self.k = nnx.Linear(
             in_features=in_features,
             out_features=self.kv_heads * head_depth,
@@ -167,8 +169,6 @@ class MultiHeadAttention(nnx.Module):
 
     def __call__(self, x: jax.Array) -> jax.Array:
         q, k, v = self.q(x), self.k(x), self.v(x)
-        if self.q_gate is not None:
-            q = q * self.q_gate.value.astype(q.dtype)
 
         head_depth = self.depth // self.num_heads
         # Reshape for multi-head attention.
@@ -180,6 +180,9 @@ class MultiHeadAttention(nnx.Module):
             group_size = self.num_heads // self.kv_heads
             k = jnp.repeat(k, group_size, axis=0)
             v = jnp.repeat(v, group_size, axis=0)
+
+        if self.q_scale is not None:
+            q = q * self.q_scale.value.astype(q.dtype)
 
         # Scaled dot-product attention.
         logits = jnp.einsum("...qd,...kd->...qk", q, k)
