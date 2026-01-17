@@ -49,6 +49,9 @@ constexpr int kDn1TheirPassedPawnsPlane = 99;
 
 constexpr int kDn1LegalChecksPlane = 100;
 
+
+constexpr int kSeeThreshold = 1;
+
 struct Dn1Planes {
   BitBoard our_pins{0};
   BitBoard their_pins{0};

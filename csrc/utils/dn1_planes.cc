@@ -32,11 +32,11 @@
 #include <cassert>
 #include <cmath>
 #include <span>
+#include <vector>
 
 #include "chess/board.h"
 #include "chess/types.h"
 #include "loader/frame_type.h"
-#include "loader/see.h"
 #include "neural/decoder.h"
 #include "neural/encoder.h"
 #include "trainingdata/reader.h"
@@ -180,6 +180,11 @@ BitBoard OurDiscoveredChecks(const ChessBoard& board) {
                 const bool is_bishop_like = board.bishops().get(next_sq) ||
                               board.queens().get(next_sq);
               if ((is_orth && is_rook_like) || (is_diag && is_bishop_like)) {
+                // TODO: Identify if pawn can capture, if so, then identify it. 
+                // If Ray is Vertical and Blocker is a Pawn, it can't step aside (ignoring captures)
+                if (df == 0 && board.pawns().get(blocker)) {
+                    break; // Don't mark result
+                }
                 result.set(blocker);
               }
             }
@@ -204,175 +209,6 @@ struct PieceAtSquare {
   bool is_valid;
 };
 
-PieceAtSquare GetPieceAt(const ChessBoard& board, Square square) {
-  const bool is_ours = board.ours().get(square);
-  const bool is_theirs = board.theirs().get(square);
-  if (!is_ours && !is_theirs) return {PieceType::FromIdx(6), false, false};
-  if (board.pawns().get(square)) return {kPawn, is_ours, true};
-  if (board.knights().get(square)) return {kKnight, is_ours, true};
-  if (board.kings().get(square)) return {kKing, is_ours, true};
-  if (board.queens().get(square)) return {kQueen, is_ours, true};
-  if (board.rooks().get(square)) return {kRook, is_ours, true};
-  if (board.bishops().get(square)) return {kBishop, is_ours, true};
-  return {PieceType::FromIdx(6), false, false};
-}
-
-BitBoard AttackersToSide(const ChessBoard& board, Square target,
-                         const BitBoard& occupied, bool side_is_ours) {
-  const BitBoard side_pieces =
-      (side_is_ours ? board.ours() : board.theirs()) & occupied;
-  const BitBoard pawns = board.pawns() & side_pieces;
-  const BitBoard knights = board.knights() & side_pieces;
-  const BitBoard bishops = board.bishops() & side_pieces;
-  const BitBoard rooks = board.rooks() & side_pieces;
-  const BitBoard queens = board.queens() & side_pieces;
-  const BitBoard kings = board.kings() & side_pieces;
-
-  BitBoard attackers(0);
-
-  const int target_file = target.file().idx;
-  const int target_rank = target.rank().idx;
-  const int pawn_rank = target_rank + (side_is_ours ? -1 : 1);
-  if (IsOnBoard(target_file - 1, pawn_rank)) {
-    Square from(File::FromIdx(target_file - 1), Rank::FromIdx(pawn_rank));
-    if (pawns.get(from)) attackers.set(from);
-  }
-  if (IsOnBoard(target_file + 1, pawn_rank)) {
-    Square from(File::FromIdx(target_file + 1), Rank::FromIdx(pawn_rank));
-    if (pawns.get(from)) attackers.set(from);
-  }
-
-  static constexpr std::array<std::pair<int, int>, 8> kKnightDeltas = {
-      std::pair<int, int>{-2, -1}, {-2, 1}, {-1, -2}, {-1, 2},
-      {1, -2}, {1, 2}, {2, -1}, {2, 1}};
-  for (const auto& [df, dr] : kKnightDeltas) {
-    const int f = target_file + df;
-    const int r = target_rank + dr;
-    if (!IsOnBoard(f, r)) continue;
-    Square from(File::FromIdx(f), Rank::FromIdx(r));
-    if (knights.get(from)) attackers.set(from);
-  }
-
-  static constexpr std::array<std::pair<int, int>, 8> kKingDeltas = {
-      std::pair<int, int>{-1, -1}, {-1, 0}, {-1, 1}, {0, -1},
-      {0, 1}, {1, -1}, {1, 0}, {1, 1}};
-  for (const auto& [df, dr] : kKingDeltas) {
-    const int f = target_file + df;
-    const int r = target_rank + dr;
-    if (!IsOnBoard(f, r)) continue;
-    Square from(File::FromIdx(f), Rank::FromIdx(r));
-    if (kings.get(from)) attackers.set(from);
-  }
-
-  static constexpr std::array<std::pair<int, int>, 4> kBishopDirs = {
-      std::pair<int, int>{1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
-  static constexpr std::array<std::pair<int, int>, 4> kRookDirs = {
-      std::pair<int, int>{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
-
-  for (const auto& [df, dr] : kBishopDirs) {
-    int f = target_file + df;
-    int r = target_rank + dr;
-    while (IsOnBoard(f, r)) {
-      Square from(File::FromIdx(f), Rank::FromIdx(r));
-      if (occupied.get(from)) {
-        if (bishops.get(from) || queens.get(from)) attackers.set(from);
-        break;
-      }
-      f += df;
-      r += dr;
-    }
-  }
-  for (const auto& [df, dr] : kRookDirs) {
-    int f = target_file + df;
-    int r = target_rank + dr;
-    while (IsOnBoard(f, r)) {
-      Square from(File::FromIdx(f), Rank::FromIdx(r));
-      if (occupied.get(from)) {
-        if (rooks.get(from) || queens.get(from)) attackers.set(from);
-        break;
-      }
-      f += df;
-      r += dr;
-    }
-  }
-
-  return attackers;
-}
-
-Square LeastValuableAttackerSquare(const ChessBoard& board, Square target,
-                                   const BitBoard& occupied,
-                                   bool side_is_ours) {
-  const BitBoard side_pieces =
-      (side_is_ours ? board.ours() : board.theirs()) & occupied;
-  const BitBoard pawns = board.pawns() & side_pieces;
-  const BitBoard knights = board.knights() & side_pieces;
-  const BitBoard bishops = board.bishops() & side_pieces;
-  const BitBoard rooks = board.rooks() & side_pieces;
-  const BitBoard queens = board.queens() & side_pieces;
-  const BitBoard kings = board.kings() & side_pieces;
-
-  const BitBoard attackers = AttackersToSide(board, target, occupied,
-                                             side_is_ours) & side_pieces;
-
-  for (auto square : (attackers & pawns)) return square;
-  for (auto square : (attackers & knights)) return square;
-  for (auto square : (attackers & bishops)) return square;
-  for (auto square : (attackers & rooks)) return square;
-  for (auto square : (attackers & queens)) return square;
-  for (auto square : (attackers & kings)) return square;
-  assert(false);
-  return Square();
-}
-
-int SeeValue(const ChessBoard& board, Move move) {
-  const Square from = move.from();
-  const Square to = move.to();
-
-  int captured_value = 0;
-  if (move.is_en_passant()) {
-    captured_value = SeePieceValue(kPawn);
-  } else {
-    const PieceAtSquare captured = GetPieceAt(board, to);
-    if (!captured.is_valid) return 0;
-    captured_value = SeePieceValue(captured.type);
-  }
-
-  std::array<int, 32> gain{};
-  int depth = 0;
-  gain[0] = captured_value;
-
-  BitBoard occupied = board.ours() | board.theirs();
-  occupied.reset(from);
-  occupied.reset(to);
-  if (move.is_en_passant()) {
-    occupied.reset(Square(to.file(), kRank5));
-  }
-
-  bool side_is_ours = false;
-  while (true) {
-    side_is_ours = !side_is_ours;
-    const BitBoard attackers =
-        AttackersToSide(board, to, occupied, side_is_ours) &
-        (side_is_ours ? board.ours() : board.theirs()) & occupied;
-    if (attackers.empty()) break;
-
-    const Square attacker =
-        LeastValuableAttackerSquare(board, to, occupied, side_is_ours);
-    const PieceAtSquare attacker_piece = GetPieceAt(board, attacker);
-    const int attacker_value = attacker_piece.is_valid
-                     ? SeePieceValue(attacker_piece.type)
-                     : 0;
-    gain[++depth] = attacker_value - gain[depth - 1];
-    if (std::max(-gain[depth - 1], gain[depth]) < 0) break;
-    occupied.reset(attacker);
-    if (depth + 1 >= static_cast<int>(gain.size())) break;
-  }
-
-  while (--depth) {
-    gain[depth - 1] = -std::max(-gain[depth - 1], gain[depth]);
-  }
-  return gain[0];
-}
 
 }  // namespace
 
@@ -384,12 +220,6 @@ Dn1Planes ComputeDn1Planes(const FrameType& frame) {
   int rule50 = 0;
   int gameply = 0;
   PopulateBoard(input_format, planes, &board, &rule50, &gameply);
-  const bool black_to_move =
-      !IsCanonicalFormat(input_format) &&
-      planes[kAuxPlaneBase + 4].mask != 0;
-  if (black_to_move) {
-    board.Mirror();
-  }
 
   const BitBoard our_pieces = board.ours();
   const BitBoard their_pieces = board.theirs();
@@ -433,7 +263,8 @@ Dn1Planes ComputeDn1Planes(const FrameType& frame) {
       out.legal_checks.set(move.to());
     }
     if (!is_capture) continue;
-    const int see_value = SeeValue(board, move);
+    // From Daniel's SEE2 Branch
+    const int see_value = board.StaticExchangeEvaluation(move, kSeeThreshold);
     if (see_value > kSeeThreshold) {
       out.see_positive.set(move.to());
     } else if (see_value == kSeeThreshold) {

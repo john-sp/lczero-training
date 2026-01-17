@@ -36,6 +36,7 @@ TensorGenerator::TensorGenerator(const TensorGeneratorConfig& config)
     : SingleInputStage<TensorGeneratorConfig, InputType>(config),
       SingleOutputStage<OutputType>(config.output()),
       batch_size_(config.batch_size()),
+      input_plane_format_(config.input_plane_format()),
       thread_pool_(config.threads(), ThreadPoolOptions{}) {
   LOG(INFO) << "Initializing TensorGenerator with " << config.threads()
             << " threads, batch size " << config.batch_size();
