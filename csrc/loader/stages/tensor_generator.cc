@@ -24,10 +24,6 @@
 namespace lczero {
 namespace training {
 
-namespace {
-
-namespace {
-
 void FillPlaneSliceFromBitboard(absl::Span<float> plane_slice,
                                 const BitBoard& board) {
   const uint64_t bits = ReverseBitsInBytes(board.as_int());
@@ -35,171 +31,14 @@ void FillPlaneSliceFromBitboard(absl::Span<float> plane_slice,
     plane_slice[square] = static_cast<float>((bits >> (square ^ 7)) & 1);
   }
 }
-
-}  // namespace
-  }
-
-  while (--depth) {
-    gain[depth - 1] = -std::max(-gain[depth - 1], gain[depth]);
-  }
-  return gain[0];
-}
-
-bool IsPassedPawn(const BitBoard& enemy_pawns, Square pawn,
-                  bool pawn_is_ours) {
-  const int pawn_file = pawn.file().idx;
-  const int pawn_rank = pawn.rank().idx;
-  for (auto enemy : enemy_pawns) {
-    const int enemy_file = enemy.file().idx;
-    if (std::abs(enemy_file - pawn_file) > 1) continue;
-    const int enemy_rank = enemy.rank().idx;
-    if (pawn_is_ours && enemy_rank > pawn_rank) return false;
-    if (!pawn_is_ours && enemy_rank < pawn_rank) return false;
-  }
-  return true;
-}
-
-bool IsSquareAttackedByUs(const ChessBoard& board, Square square) {
-  ChessBoard mirrored = board;
-  mirrored.Mirror();
-  Square mirrored_square = square;
-  mirrored_square.Flip();
-  return mirrored.IsUnderAttack(mirrored_square);
-}
-
-struct Dn1Planes {
-  BitBoard control_plus{0};
-  BitBoard control_equal{0};
-  BitBoard control_minus{0};
-  BitBoard our_pins{0};
-  BitBoard their_pins{0};
-  BitBoard our_hanging{0};
-  BitBoard their_hanging{0};
-  BitBoard our_passed_pawns{0};
-  BitBoard their_passed_pawns{0};
-  BitBoard legal_checks{0};
-  BitBoard see_positive{0};
-  BitBoard see_equal{0};
-  BitBoard see_negative{0};
-};
-
-Dn1Planes ComputeDn1Planes(const FrameType& frame) {
-  const auto input_format =
-      static_cast<pblczero::NetworkFormat::InputFormat>(frame.input_format);
-  InputPlanes planes = PlanesFromTrainingDataNoTransform(frame);
-  ChessBoard board;
-  int rule50 = 0;
-  int gameply = 0;
-  PopulateBoard(input_format, planes, &board, &rule50, &gameply);
-
-  const BitBoard our_pieces = board.ours();
-  const BitBoard their_pieces = board.theirs();
-  const BitBoard our_king = board.kings() & our_pieces;
-  const BitBoard their_king = board.kings() & their_pieces;
-
-  const auto our_attacks = ComputeAttackCounts(board, our_pieces, true);
-  const auto their_attacks = ComputeAttackCounts(board, their_pieces, false);
-
-  Dn1Planes out;
-
-  for (auto square : (our_pieces | their_pieces)) {
-    const int idx = square.as_idx();
-    const int our_count = our_attacks[idx];
-    const int their_count = their_attacks[idx];
-    if (their_count == 0 || our_count == 0) continue;
-    if (our_count > their_count) {
-      out.control_plus.set(square);
-    } else if (our_count == their_count) {
-      out.control_equal.set(square);
-    } else {
-      out.control_minus.set(square);
-    }
-  }
-
-  out.our_pins = board.GenerateKingAttackInfo().pinned_pieces_;
-
-  {
-    ChessBoard mirrored = board;
-    mirrored.Mirror();
-    out.their_pins = mirrored.GenerateKingAttackInfo().pinned_pieces_;
-    out.their_pins.Mirror();
-  }
-
-  for (auto square : our_pieces) {
-    if (our_king.get(square)) continue;
-    const int idx = square.as_idx();
-    if (their_attacks[idx] > 0 && our_attacks[idx] == 0) {
-      out.our_hanging.set(square);
-    }
-  }
-  for (auto square : their_pieces) {
-    if (their_king.get(square)) continue;
-    const int idx = square.as_idx();
-    if (our_attacks[idx] > 0 && their_attacks[idx] == 0) {
-      out.their_hanging.set(square);
-    }
-  }
-
-  const BitBoard our_pawns = board.pawns() & our_pieces;
-  const BitBoard their_pawns = board.pawns() & their_pieces;
-  for (auto square : our_pawns) {
-    if (IsPassedPawn(their_pawns, square, true)) {
-      out.our_passed_pawns.set(square);
-    }
-  }
-  for (auto square : their_pawns) {
-    if (IsPassedPawn(our_pawns, square, false)) {
-      out.their_passed_pawns.set(square);
-    }
-  }
-
-  const MoveList legal_moves = board.GenerateLegalMoves();
-  for (const auto& move : legal_moves) {
-    const bool is_capture =
-        move.is_en_passant() || board.theirs().get(move.to());
-    ChessBoard copy = board;
-    copy.ApplyMove(move);
-    const Square opponent_king = SingleSquare(copy.kings() & copy.theirs());
-    if (IsSquareAttackedByUs(copy, opponent_king)) {
-      out.legal_checks.set(move.to());
-    }
-    if (!is_capture) continue;
-    const int see_value = SeeValue(board, move);
-    if (see_value > kSeeThreshold) {
-      out.see_positive.set(move.to());
-    } else if (see_value == kSeeThreshold) {
-      out.see_equal.set(move.to());
-    } else if (see_value < 0) {
-      out.see_negative.set(move.to());
-    }
-  }
-
-  return out;
-}
-
-void FillPlaneSliceFromBitboard(absl::Span<float> plane_slice,
-                                const BitBoard& board) {
-  const uint64_t bits = ReverseBitsInBytes(board.as_int());
-  for (ssize_t square = 0; square < 64; ++square) {
-    plane_slice[square] = static_cast<float>((bits >> (square ^ 7)) & 1);
-  }
-}
-
-}  // namespace
 
 TensorGenerator::TensorGenerator(const TensorGeneratorConfig& config)
     : SingleInputStage<TensorGeneratorConfig, InputType>(config),
       SingleOutputStage<OutputType>(config.output()),
       batch_size_(config.batch_size()),
-      input_plane_format_(config.input_plane_format()),
       thread_pool_(config.threads(), ThreadPoolOptions{}) {
   LOG(INFO) << "Initializing TensorGenerator with " << config.threads()
             << " threads, batch size " << config.batch_size();
-  if (input_plane_format_ !=
-      TensorGeneratorConfig::INPUT_PLANE_FORMAT_LEGACY) {
-    LOG(INFO) << "TensorGenerator input plane format set to "
-              << input_plane_format_ << ".";
-  }
 
   // Initialize thread contexts but don't start worker threads yet.
   thread_contexts_.reserve(config.threads());
@@ -410,6 +249,10 @@ void TensorGenerator::ProcessPlanes(const std::vector<FrameType>& frames,
         }
         if (plane == kDn1LegalChecksPlane) {
           FillPlaneSliceFromBitboard(plane_slice, dn1.legal_checks);
+          continue;
+        }
+        if (plane == kDn1OurDiscoveredChecksPlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.our_discovered_checks);
           continue;
         }
       }

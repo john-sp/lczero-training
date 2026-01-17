@@ -149,6 +149,55 @@ bool IsSquareAttackedByUs(const ChessBoard& board, Square square) {
   return mirrored.IsUnderAttack(mirrored_square);
 }
 
+BitBoard OurDiscoveredChecks(const ChessBoard& board) {
+  const Square enemy_king =
+      SingleSquare(board.kings() & board.theirs());
+  const BitBoard occupied = board.ours() | board.theirs();
+  BitBoard result(0);
+
+  static constexpr std::array<std::pair<int, int>, 8> kDirections = {
+      std::pair<int, int>{1, 0}, {0, 1}, {-1, 0}, {0, -1},
+      std::pair<int, int>{1, 1}, {-1, 1}, {1, -1}, {-1, -1}};
+
+  for (const auto& [df, dr] : kDirections) {
+    int f = enemy_king.file().idx + df;
+    int r = enemy_king.rank().idx + dr;
+    while (IsOnBoard(f, r)) {
+      Square sq(File::FromIdx(f), Rank::FromIdx(r));
+      if (occupied.get(sq)) {
+        if (!board.ours().get(sq)) break;
+        Square blocker = sq;
+        f += df;
+        r += dr;
+        while (IsOnBoard(f, r)) {
+          Square next_sq(File::FromIdx(f), Rank::FromIdx(r));
+          if (occupied.get(next_sq)) {
+            if (board.ours().get(next_sq)) {
+              const bool is_orth = df == 0 || dr == 0;
+              const bool is_diag = std::abs(df) == std::abs(dr);
+                const bool is_rook_like = board.rooks().get(next_sq) ||
+                            board.queens().get(next_sq);
+                const bool is_bishop_like = board.bishops().get(next_sq) ||
+                              board.queens().get(next_sq);
+              if ((is_orth && is_rook_like) || (is_diag && is_bishop_like)) {
+                result.set(blocker);
+              }
+            }
+            break;
+          }
+          f += df;
+          r += dr;
+        }
+        break;
+      }
+      f += df;
+      r += dr;
+    }
+  }
+
+  return result;
+}
+
 struct PieceAtSquare {
   PieceType type;
   bool is_ours;
@@ -357,6 +406,8 @@ Dn1Planes ComputeDn1Planes(const FrameType& frame) {
     out.their_pins = mirrored.GenerateKingAttackInfo().pinned_pieces_;
     out.their_pins.Mirror();
   }
+
+  out.our_discovered_checks = OurDiscoveredChecks(board);
 
   const BitBoard our_pawns = board.pawns() & our_pieces;
   const BitBoard their_pawns = board.pawns() & their_pieces;

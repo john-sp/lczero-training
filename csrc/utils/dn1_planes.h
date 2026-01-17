@@ -28,6 +28,7 @@
 #pragma once
 
 #include "chess/bitboard.h"
+#include "loader/frame_type.h"
 
 namespace lczero::training {
 
@@ -41,13 +42,12 @@ constexpr int kDn1SeeNegativePlane = 93;
 
 constexpr int kDn1OurPinsPlane = 94;
 constexpr int kDn1TheirPinsPlane = 95;
+constexpr int kDn1OurDiscoveredChecksPlane = 96;
 
 constexpr int kDn1OurPassedPawnsPlane = 98;
 constexpr int kDn1TheirPassedPawnsPlane = 99;
 
 constexpr int kDn1LegalChecksPlane = 100;
-
-struct FrameType;
 
 struct Dn1Planes {
   BitBoard our_pins{0};
@@ -55,6 +55,7 @@ struct Dn1Planes {
   BitBoard our_passed_pawns{0};
   BitBoard their_passed_pawns{0};
   BitBoard legal_checks{0};
+  BitBoard our_discovered_checks{0};
   BitBoard see_positive{0};
   BitBoard see_equal{0};
   BitBoard see_negative{0};
