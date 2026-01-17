@@ -220,11 +220,16 @@ Dn1Planes ComputeDn1Planes(const FrameType& frame) {
   int rule50 = 0;
   int gameply = 0;
   PopulateBoard(input_format, planes, &board, &rule50, &gameply);
-
+  // Mirror board if it is black to move
+  
   const BitBoard our_pieces = board.ours();
   const BitBoard their_pieces = board.theirs();
-  const BitBoard our_king = board.kings() & our_pieces;
-  const BitBoard their_king = board.kings() & their_pieces;
+  //const BitBoard our_king = board.kings() & our_pieces;
+  //const BitBoard their_king = board.kings() & their_pieces;
+  if (frame.side_to_move_or_enpassant != 0) {
+    // Swap our and their pieces
+    std::swap(our_pieces, their_pieces);
+  }
 
   Dn1Planes out;
 
@@ -255,21 +260,26 @@ Dn1Planes ComputeDn1Planes(const FrameType& frame) {
   const MoveList legal_moves = board.GenerateLegalMoves();
   for (const auto& move : legal_moves) {
     const bool is_capture =
-        move.is_en_passant() || board.theirs().get(move.to());
+        move.is_en_passant() || their_pieces.get(move.to());
     ChessBoard copy = board;
     copy.ApplyMove(move);
-    const Square opponent_king = SingleSquare(copy.kings() & copy.theirs());
+    // Check if move gives check to opponent's king. "Ours" always refers to white, so if side_to_move is black, we need to look at "our" king 
+    const Square opponent_king = frame.side_to_move_or_enpassant ? SingleSquare(copy.kings() & copy.theirs()) : SingleSquare(copy.kings() & copy.ours());
+    
     if (IsSquareAttackedByUs(copy, opponent_king)) {
       out.legal_checks.set(move.to());
     }
     if (!is_capture) continue;
-    // From Daniel's SEE2 Branch
-    const int see_value = board.StaticExchangeEvaluation(move, kSeeThreshold);
-    if (see_value > kSeeThreshold) {
+
+    const int see_value = board.StaticExchangeEvaluation(move);
+    if (see_value >= kSeeThreshold) {
+      // LOG(INFO) << "Positive SEE move: " << move.ToString(false) << " value: " << see_value;
       out.see_positive.set(move.to());
-    } else if (see_value == kSeeThreshold) {
+    } else if (see_value < kSeeThreshold && see_value >= 0) {
+        // LOG(INFO) << "Equal SEE move: " << move.ToString(false) << " value: " << see_value;
       out.see_equal.set(move.to());
     } else if (see_value < 0) {
+        // LOG(INFO) << "Negative SEE move: " << move.ToString(false) << " value: " << see_value;
       out.see_negative.set(move.to());
     }
   }
