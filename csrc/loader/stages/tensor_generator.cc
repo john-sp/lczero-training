@@ -268,8 +268,8 @@ void TensorGenerator::ProcessPlanes(const std::vector<FrameType>& frames,
           FillPlaneSliceFromBitboard(plane_slice, dn1.control_minus);
           continue;
         }
-        if (plane == kDn1DrawPlane) {
-          FillPlaneSliceFromBitboard(plane_slice, dn1.draw);
+        if (plane == kDn1OurHangingPlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.our_hanging);
           continue;
         }
       }

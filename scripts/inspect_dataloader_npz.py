@@ -55,14 +55,18 @@ def _plane_to_bitboard_mask(plane: np.ndarray) -> int:
     return mask
 
 
-def _mask_to_squares(mask: int) -> list[str]:
+def _mask_to_squares(mask: int, *, reverse_ranks: bool = False) -> list[str]:
     squares: list[str] = []
     files = "abcdefgh"
-    for idx in range(64):
-        if mask & (1 << idx):
-            file = files[idx % 8]
-            rank = (idx // 8) + 1
-            squares.append(f"{file}{rank}")
+    for rank in range(8):
+        for file in range(8):
+            idx = rank * 8 + file
+            if mask & (1 << idx):
+                if reverse_ranks:
+                    display_rank = 8 - rank
+                else:
+                    display_rank = rank + 1
+                squares.append(f"{files[file]}{display_rank}")
     return squares
 
 
@@ -160,9 +164,12 @@ def _fen_from_inputs(inputs: np.ndarray) -> str:
 
 
 def _print_plane_squares(planes: np.ndarray, plane_start: int, plane_end: int) -> None:
+    reverse_ranks = False
+    if planes.shape[0] > 108:
+        reverse_ranks = np.any(planes[108] != 0)
     for plane_idx in range(plane_start, plane_end + 1):
         mask = _plane_to_bitboard_mask(planes[plane_idx])
-        squares = _mask_to_squares(mask)
+        squares = _mask_to_squares(mask, reverse_ranks=reverse_ranks)
         print(f"plane[{plane_idx}]: {', '.join(squares) if squares else '-'}")
 
 

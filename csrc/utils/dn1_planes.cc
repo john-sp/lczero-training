@@ -259,8 +259,8 @@ Dn1Planes ComputeDn1Planes(const FrameType& frame) {
   const bool black_to_move =
       !IsCanonicalFormat(input_format) && frame.side_to_move_or_enpassant != 0;
 
-  const BitBoard our_pieces = black_to_move ? board.theirs() : board.ours();
-  const BitBoard their_pieces = black_to_move ? board.ours() : board.theirs();
+  const BitBoard our_pieces = board.ours();
+  const BitBoard their_pieces = board.theirs();
   //const BitBoard our_king = board.kings() & our_pieces;
   //const BitBoard their_king = board.kings() & their_pieces;
 
@@ -293,10 +293,20 @@ Dn1Planes ComputeDn1Planes(const FrameType& frame) {
   const auto our_attacks = ComputeAttackCounts(board, our_pieces, true);
   const auto their_attacks = ComputeAttackCounts(board, their_pieces, false);
 
+  for (auto square : our_pieces) {
+    const int idx = square.as_idx();
+    const int our_count = our_attacks[idx];
+    const int their_count = their_attacks[idx];
+    if (our_count == 0 && their_count > 0 ) {
+        out.our_hanging.set(square);
+    }
+  }
+
   for (auto square : (our_pieces | their_pieces)) {
     const int idx = square.as_idx();
     const int our_count = our_attacks[idx];
     const int their_count = their_attacks[idx];
+    
     if (their_count == 0 || our_count == 0) continue;
     if (our_count > their_count) {
       out.control_plus.set(square);
@@ -305,6 +315,7 @@ Dn1Planes ComputeDn1Planes(const FrameType& frame) {
     } else {
       out.control_minus.set(square);
     }
+
   }
 
   const MoveList legal_moves = board.GenerateLegalMoves();
@@ -312,16 +323,11 @@ Dn1Planes ComputeDn1Planes(const FrameType& frame) {
     Square dest = move.to();
 
     ChessBoard copy = board;
-    copy.ApplyMove(move);
+    bool isZeroing = copy.ApplyMove(move);
     copy.Mirror();
     
     if (copy.IsUnderCheck()) {
       out.legal_checks.set(dest);
-    }
-
-    if ((!copy.HasMatingMaterial()) || copy.GenerateLegalMoves().empty())
-    { // In engine, check if the position is a draw, this calculates 3 fold repetition, 50 move rule, insufficient material, stalemate, etc.
-        out.draw.set(dest);
     }
     
     
