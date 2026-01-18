@@ -40,14 +40,20 @@ constexpr int kDn1SeePositivePlane = 91;
 constexpr int kDn1SeeEqualPlane = 92;
 constexpr int kDn1SeeNegativePlane = 93;
 
-constexpr int kDn1OurPinsPlane = 94;
-constexpr int kDn1TheirPinsPlane = 95;
-constexpr int kDn1OurDiscoveredChecksPlane = 96;
+constexpr int kDn1ControlPlusPlane = 94;
+constexpr int kDn1ControlEqualPlane = 95;
+constexpr int kDn1ControlMinusPlane = 96;
 
-constexpr int kDn1OurPassedPawnsPlane = 98;
-constexpr int kDn1TheirPassedPawnsPlane = 99;
+constexpr int kDn1DrawPlane = 97;
 
-constexpr int kDn1LegalChecksPlane = 100;
+constexpr int kDn1OurPinsPlane = 98;
+constexpr int kDn1TheirPinsPlane = 99;
+constexpr int kDn1OurDiscoveredChecksPlane = 100;
+
+constexpr int kDn1OurPassedPawnsPlane = 101;
+constexpr int kDn1TheirPassedPawnsPlane = 102;
+
+constexpr int kDn1LegalChecksPlane = 103;
 
 
 constexpr int kSeeThreshold = 1;
@@ -62,6 +68,10 @@ struct Dn1Planes {
   BitBoard see_positive{0};
   BitBoard see_equal{0};
   BitBoard see_negative{0};
+  BitBoard draw{0};
+  BitBoard control_plus{0};
+  BitBoard control_equal{0};
+  BitBoard control_minus{0};
 };
 
 Dn1Planes ComputeDn1Planes(const FrameType& frame);

@@ -72,24 +72,48 @@ def _fen_from_inputs(inputs: np.ndarray) -> str:
         raise ValueError(
             f"Expected at least 112 planes, got {planes.shape[0]}"
         )
+    
+    def _plane_has_any(plane_idx: int) -> bool:
+        return np.any(planes[plane_idx] != 0)
+
+    black_to_move = _plane_has_any(108)
+
     piece_masks = [_plane_to_bitboard_mask(planes[i]) for i in range(12)]
-    piece_order = [
-        (piece_masks[0], "P"),
-        (piece_masks[1], "N"),
-        (piece_masks[2], "B"),
-        (piece_masks[3], "R"),
-        (piece_masks[4], "Q"),
-        (piece_masks[5], "K"),
-        (piece_masks[6], "p"),
-        (piece_masks[7], "n"),
-        (piece_masks[8], "b"),
-        (piece_masks[9], "r"),
-        (piece_masks[10], "q"),
-        (piece_masks[11], "k"),
-    ]
+    if black_to_move:
+        piece_order = [
+            (piece_masks[0], "p"),
+            (piece_masks[1], "n"),
+            (piece_masks[2], "b"),
+            (piece_masks[3], "r"),
+            (piece_masks[4], "q"),
+            (piece_masks[5], "k"),
+            (piece_masks[6], "P"),
+            (piece_masks[7], "N"),
+            (piece_masks[8], "B"),
+            (piece_masks[9], "R"),
+            (piece_masks[10], "Q"),
+            (piece_masks[11], "K"),
+        ]
+        rank_range = range(8)
+    else:
+        piece_order = [
+            (piece_masks[0], "P"),
+            (piece_masks[1], "N"),
+            (piece_masks[2], "B"),
+            (piece_masks[3], "R"),
+            (piece_masks[4], "Q"),
+            (piece_masks[5], "K"),
+            (piece_masks[6], "p"),
+            (piece_masks[7], "n"),
+            (piece_masks[8], "b"),
+            (piece_masks[9], "r"),
+            (piece_masks[10], "q"),
+            (piece_masks[11], "k"),
+        ]
+        rank_range = range(7, -1, -1)
 
     rows: list[str] = []
-    for rank in range(7, -1, -1):
+    for rank in rank_range:
         empty = 0
         row = ""
         for file in range(8):
@@ -112,9 +136,6 @@ def _fen_from_inputs(inputs: np.ndarray) -> str:
 
     board = "/".join(rows)
 
-    def _plane_has_any(plane_idx: int) -> bool:
-        return np.any(planes[plane_idx] != 0)
-
     # Classic 112-plane aux mapping.
     castling = ""
     if _plane_has_any(104):
@@ -128,7 +149,6 @@ def _fen_from_inputs(inputs: np.ndarray) -> str:
     if not castling:
         castling = "-"
 
-    black_to_move = _plane_has_any(108)
     side = "b" if black_to_move else "w"
 
     en_passant = "-"

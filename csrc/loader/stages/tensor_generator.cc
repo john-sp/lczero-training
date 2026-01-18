@@ -256,6 +256,22 @@ void TensorGenerator::ProcessPlanes(const std::vector<FrameType>& frames,
           FillPlaneSliceFromBitboard(plane_slice, dn1.our_discovered_checks);
           continue;
         }
+        if (plane == kDn1ControlPlusPlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.control_plus);
+          continue;
+        }
+        if (plane == kDn1ControlEqualPlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.control_equal);
+          continue;
+        }
+        if (plane == kDn1ControlMinusPlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.control_minus);
+          continue;
+        }
+        if (plane == kDn1DrawPlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.draw);
+          continue;
+        }
       }
 
       uint64_t plane_bits = frame.planes[plane];
