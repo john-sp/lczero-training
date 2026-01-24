@@ -142,10 +142,14 @@ class TrainingPipeline:
         logger.info("Restoring checkpoint")
         optimizer_config = self._config.training.optimizer
         max_grad_norm = getattr(self._config.training, "max_grad_norm", 0.0)
+        l2_regularization = getattr(
+            self._config.training, "l2_regularization", 0.0
+        )
         self._lr_schedule = make_lr_schedule(self._config.training.lr_schedule)
         optimizer_tx = make_gradient_transformation(
             optimizer_config,
             max_grad_norm=max_grad_norm,
+            l2_regularization=l2_regularization,
             lr_schedule=self._lr_schedule,
         )
         model_state = nnx.state(self._model)
@@ -218,6 +222,7 @@ class TrainingPipeline:
             optimizer_tx=make_gradient_transformation(
                 self._config.training.optimizer,
                 max_grad_norm=max_grad_norm,
+                l2_regularization=l2_regularization,
                 lr_schedule=self._lr_schedule,
             ),
             graphdef=nnx.graphdef(self._model),

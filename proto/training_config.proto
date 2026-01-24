@@ -11,6 +11,8 @@ message TrainingConfig {
   LossConfig losses = 5;
   // Maximum gradient norm; set to 0 or omit to disable clipping.
   float max_grad_norm = 6;
+  // L2 regularization coefficient; set to 0 or omit to disable.
+  float l2_regularization = 9;
   // Stochastic Weight Averaging (SWA) configuration. When absent, SWA is
   // disabled.
   SWAConfig swa = 7;
@@ -83,6 +85,47 @@ message MuonOptimizerConfig {
 }
 
 message NadamwOptimizerConfig {
+  float beta_1 = 1;
+  float beta_2 = 2;
+  float epsilon = 3;
+  float weight_decay = 4;
+  // Selector for weight decay. True = apply decay to this category.
+  WeightsSelector decay_selector = 5;
+}
+
+message NadamOptimizerConfig {
+  float beta_1 = 1;
+  float beta_2 = 2;
+  float epsilon = 3;
+}
+
+message SgdOptimizerConfig {
+  float momentum = 1;
+  bool nesterov = 2;
+}
+
+// Selector for which weight categories to include.
+message WeightsSelector {
+  bool embedding = 1;
+  bool biases = 2;
+  bool layer_norms = 3;
+  bool policy_heads = 4;
+  bool value_heads = 5;
+  bool movesleft_heads = 6;
+}
+
+message SgdOptimizerConfig {
+  float weight_decay = 1;
+  bool nesterov = 2;
+  bool decay_embedding = 3;
+  bool decay_biases = 4;
+  bool decay_layer_norms = 5;
+  bool decay_policy_heads = 6;
+  bool decay_value_heads = 7;
+  bool decay_movesleft_heads = 8;
+}
+
+message AdamwOptimizerConfig {
   float beta_1 = 1;
   float beta_2 = 2;
   float epsilon = 3;

@@ -40,24 +40,14 @@ def _make_optimizer_with_schedule(
     schedule: optax.Schedule,
 ) -> optax.GradientTransformation:
     max_grad_norm = getattr(config.training, "max_grad_norm", 0.0)
+    l2_regularization = getattr(config.training, "l2_regularization", 0.0)
     opt_config = config.training.optimizer
-
-    if opt_config.HasField("nadamw"):
-        conf = opt_config.nadamw
-        tx: optax.GradientTransformation = optax.nadamw(
-            schedule,
-            b1=conf.beta_1,
-            b2=conf.beta_2,
-            eps=conf.epsilon,
-            weight_decay=conf.weight_decay,
-        )
-    else:
-        raise ValueError(
-            f"Unsupported optimizer type: {opt_config.WhichOneof('optimizer_type')}"
-        )
-
-    if max_grad_norm > 0:
-        tx = optax.chain(optax.clip_by_global_norm(max_grad_norm), tx)
+    tx = make_gradient_transformation(
+        opt_config,
+        max_grad_norm=max_grad_norm,
+        l2_regularization=l2_regularization,
+        lr_schedule=schedule,
+    )
 
     if training_state.jit_state.opt_state is None:
         raise ValueError("Optimizer state must be available in the checkpoint.")

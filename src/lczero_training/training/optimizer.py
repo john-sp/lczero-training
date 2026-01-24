@@ -1,5 +1,5 @@
 from functools import partial
-from typing import Union
+from typing import Any, Union
 
 import jax
 import jax.numpy as jnp
@@ -11,14 +11,19 @@ import optax.contrib
 from flax import nnx
 
 from proto.training_config_pb2 import (
+    AdamwOptimizerConfig,
     MuonOptimizerConfig,
     NadamwOptimizerConfig,
     OptimizerConfig,
+    SgdOptimizerConfig,
 )
 
 
 def _make_weight_decay_mask(
-    config: Union[NadamwOptimizerConfig, MuonOptimizerConfig], params: nnx.State
+    config: Union[
+        AdamwOptimizerConfig, MuonOptimizerConfig, NadamwOptimizerConfig, SgdOptimizerConfig
+    ],
+    params: nnx.State,
 ) -> nnx.State:
     """Creates a mask that excludes bias and LayerNorm parameters from decay."""
 
@@ -87,10 +92,33 @@ def update_optimizer_step(
     )
 
 
+def _apply_auxiliary_transforms(
+    tx: optax.GradientTransformation,
+    *,
+    max_grad_norm: float | None,
+    l2_regularization: float | None,
+    weight_decay_mask: Any | None,
+) -> optax.GradientTransformation:
+    transforms: list[optax.GradientTransformation] = []
+
+    if l2_regularization is not None and l2_regularization > 0:
+        transforms.append(
+            optax.add_decayed_weights(l2_regularization, weight_decay_mask)
+        )
+    if max_grad_norm is not None and max_grad_norm > 0:
+        transforms.append(optax.clip_by_global_norm(max_grad_norm))
+
+    if not transforms:
+        return tx
+    transforms.append(tx)
+    return optax.chain(*transforms)
+
+
 def make_gradient_transformation(
     config: OptimizerConfig,
     *,
     max_grad_norm: float | None = None,
+    l2_regularization: float | None = None,
     lr_schedule: optax.Schedule,
 ) -> optax.GradientTransformation:
     if config.HasField("nadamw"):

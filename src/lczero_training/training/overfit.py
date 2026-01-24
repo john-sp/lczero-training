@@ -162,6 +162,7 @@ def overfit(
     optimizer_tx = make_gradient_transformation(
         config.training.optimizer,
         max_grad_norm=getattr(config.training, "max_grad_norm", 0.0),
+        l2_regularization=getattr(config.training, "l2_regularization", 0.0),
         lr_schedule=lr_sched,
     )
 

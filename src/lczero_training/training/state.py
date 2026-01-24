@@ -136,6 +136,9 @@ class TrainingState:
         opt_state = make_gradient_transformation(
             training_config.optimizer,
             max_grad_norm=getattr(training_config, "max_grad_norm", 0.0),
+            l2_regularization=getattr(
+                training_config, "l2_regularization", 0.0
+            ),
             lr_schedule=lr_sched,
         ).init(model_state)
         jit_state = JitTrainingState(
