@@ -34,7 +34,7 @@ def _make_weight_decay_mask(
         )
 
     def is_embedding(path: tuple[object, ...]) -> bool:
-        return ("embedding", "embedding") in zip(path, path[1:])
+        return "embedding" in map(str, path)
 
     def is_bias(path: tuple[object, ...]) -> bool:
         return str(path[-1]).lower() == "bias"

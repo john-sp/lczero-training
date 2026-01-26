@@ -330,7 +330,9 @@ class PolicyLoss(LossBase):
             sample.probabilities, dtype=policy_pred.dtype
         )
         if self.config.illegal_moves == PolicyLossConfig.MASK:
-            policy_pred = jnp.where(policy_targets >= 0, policy_pred, -jnp.inf)
+            # Use -1e10 instead of -inf to avoid NaN in gradients when
+            # computing 0 * log(softmax(-inf)).
+            policy_pred = jnp.where(policy_targets >= 0, policy_pred, -1.0e10)
 
         # Zero out negative targets for illegal moves.
         policy_targets = jax.nn.relu(policy_targets)
