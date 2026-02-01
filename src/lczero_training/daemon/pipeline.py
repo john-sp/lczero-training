@@ -305,12 +305,7 @@ class TrainingPipeline:
             export_options=options,
             model_config=self._config.model,
         )
-        logging.info(f"Writing model to {export_filename}")
-        os.makedirs(self._config.export.path, exist_ok=True)
-        with gzip.open(export_filename, "wb") as f:
-            f.write(net.SerializeToString())
-        logging.info(f"Finished writing model to {export_filename}")
-        return export_filename
+        return gzip.compress(net.SerializeToString())
 
     def _save_network(self, network_bytes: bytes) -> None:
         date_str = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
