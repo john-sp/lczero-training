@@ -148,6 +148,14 @@ class LczeroLoss:
             unweighted_losses[f"policy/{policy_loss.metric_name}"] = loss
             weighted_losses.append(loss * policy_loss.weight)
 
+            # Compute policy accuracy as a metric (not contributing to loss).
+            # Only compute for the "vanilla" policy head.
+            if policy_loss.head_name == "vanilla":
+                accuracy = policy_loss.compute_accuracy(predictions, sample)
+                unweighted_losses[
+                    f"policy/{policy_loss.metric_name}/accuracy"
+                ] = accuracy
+
         for value_loss in self.value_losses:
             loss = value_loss(predictions, sample)
             unweighted_losses[f"value/{value_loss.metric_name}"] = loss
@@ -364,6 +372,30 @@ class PolicyLoss(LossBase):
             loss = loss * self._compute_optimistic_weight(value_pred, target_q)
 
         return loss
+
+    def compute_accuracy(
+        self,
+        predictions: ModelPrediction,
+        sample: TrainingSample,
+    ) -> jax.Array:
+        """Compute policy accuracy by comparing argmax of targets and predictions.
+
+        Returns:
+            Scalar accuracy value (fraction of correct predictions per sample).
+        """
+        policy_pred = predictions.policy[self.head_name]
+        # Extract probabilities from sample.
+        policy_targets = jnp.asarray(
+            sample.probabilities, dtype=policy_pred.dtype
+        )
+        # Zero out negative targets for illegal moves.
+        policy_targets = jax.nn.relu(policy_targets)
+
+        target_move = jnp.argmax(policy_targets, axis=-1)
+        predicted_move = jnp.argmax(policy_pred, axis=-1)
+        correct = jnp.equal(target_move, predicted_move).astype(jnp.float32)
+
+        return correct
 
 
 class MovesLeftLoss(LossBase):
