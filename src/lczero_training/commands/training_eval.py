@@ -44,6 +44,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Dump input/output tensors to specified JSON file.",
     )
     parser.add_argument(
+        "--dump-npz",
+        type=str,
+        help="Dump input/output tensors to specified NPZ file.",
+    )
+    parser.add_argument(
         "--onnx-model",
         type=str,
         help="Path to an ONNX model to compare against JAX outputs.",
@@ -73,6 +78,7 @@ def main(argv: list[str] | None = None) -> int:
         dump_to_file=args.dump_file,
         dump_to_shelve=args.dump_shelve,
         dump_to_json=args.dump_json,
+        dump_to_npz=args.dump_npz,
         onnx_model=args.onnx_model,
         softmax_jax_wdl=not args.no_softmax_jax_wdl,
     )
