@@ -154,14 +154,14 @@ class LczeroLoss:
             if policy_loss.head_name == "vanilla":
                 accuracy = policy_loss.compute_accuracy(predictions, sample)
                 unweighted_losses[
-                    f"policy/{policy_loss.metric_name}/accuracy"
+                    f"policy/{policy_loss.metric_name}/accuracy_unmasked"
                 ] = accuracy
  
                 masked_accuracy = policy_loss.compute_masked_accuracy(
                     predictions, sample
                 )
                 unweighted_losses[
-                    f"policy/{policy_loss.metric_name}/accuracy_masked"
+                    f"policy/{policy_loss.metric_name}/accuracy"
                 ] = masked_accuracy
 
         for value_loss in self.value_losses:
