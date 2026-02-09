@@ -146,6 +146,24 @@ class Training:
             )
             grad_norm = optax.global_norm(mean_grads)
 
+            def compute_single_loss_grad_norm(loss_key: str):
+                def single_loss_fn(
+                    model_arg: LczeroModel,
+                    batch_arg: TrainingBatch,
+                    teacher_model_arg: Optional[LczeroModel] = None,
+                ) -> jax.Array:
+                    _, unweighted = loss_vfn(model_arg, batch_arg, teacher_model_arg)
+                    return jnp.mean(unweighted[loss_key])
+                
+                grads = nnx.grad(single_loss_fn)(model, batch, teacher_model)
+                return optax.global_norm(grads)
+            
+            # Compute gradient norms for the two losses you care about
+            component_norms = {
+                "value/winner": compute_single_loss_grad_norm("value/winner"),
+                "policy/vanilla": compute_single_loss_grad_norm("policy/vanilla"),
+            }
+
             assert jit_state.opt_state is not None
             updates, new_opt_state = optimizer_tx.update(
                 mean_grads, jit_state.opt_state, jit_state.model_state
@@ -165,6 +183,7 @@ class Training:
                 "loss": mean_loss,
                 "unweighted_losses": mean_unweighted,
                 "grad_norm": grad_norm,
+                "component_norms": component_norms,
             }
             return new_jit_state, metrics
 
