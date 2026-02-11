@@ -11,13 +11,15 @@ message TrainingConfig {
   LossConfig losses = 5;
   // Maximum gradient norm; set to 0 or omit to disable clipping.
   float max_grad_norm = 6;
-  // L2 regularization coefficient; set to 0 or omit to disable.
-  float l2_regularization = 9;
   // Stochastic Weight Averaging (SWA) configuration. When absent, SWA is
   // disabled.
   SWAConfig swa = 7;
   // Teacher configuration for knowledge distillation.
   TeacherConfig teacher = 8;
+  // Period (in steps) for computing per-component gradient norms.
+  // 0 (default) disables the feature entirely — no extra compute or memory.
+  // When > 0, component norms are computed every N steps.
+  uint32 component_grad_norm_period = 9;
 }
 
 import "proto/model_config.proto";

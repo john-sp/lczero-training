@@ -156,7 +156,7 @@ class LczeroLoss:
                 unweighted_losses[
                     f"policy/{policy_loss.metric_name}/accuracy_unmasked"
                 ] = accuracy
- 
+
                 masked_accuracy = policy_loss.compute_masked_accuracy(
                     predictions, sample
                 )
@@ -222,6 +222,24 @@ class LczeroLoss:
                     # T^2 * KL(softmax(teacher_logits/T), softmax(student_logits/T))
                     teacher_probs = jax.nn.softmax(teacher_logits / temp)
                     teacher_probs = jax.lax.stop_gradient(teacher_probs)
+
+                    policy_targets = jnp.asarray(
+                        sample.probabilities, dtype=student_logits.dtype
+                    )
+                    legal_mask = policy_targets >= 0
+                    student_logits = jnp.where(
+                        legal_mask, student_logits, -1.0e10
+                    )
+                    teacher_probs = jnp.where(legal_mask, teacher_probs, 0.0)
+                    teacher_probs_sum = jnp.sum(
+                        teacher_probs, axis=-1, keepdims=True
+                    )
+                    safe_sum = jnp.where(
+                        teacher_probs_sum > 0,
+                        teacher_probs_sum,
+                        jnp.ones_like(teacher_probs_sum),
+                    )
+                    teacher_probs = teacher_probs / safe_sum
 
                     kd_loss = optax.softmax_cross_entropy(
                         logits=student_logits / temp, labels=teacher_probs

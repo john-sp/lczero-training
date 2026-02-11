@@ -153,7 +153,7 @@ class TrainingPipeline:
             lr_schedule=self._lr_schedule,
         )
         model_state = nnx.state(self._model)
-        
+
         # Initialize empty state without teacher for restoration compatibility
         jit_state = JitTrainingState(
             step=0,
@@ -188,7 +188,9 @@ class TrainingPipeline:
             and teacher_model_config is not None
         ):
             teacher_config = self._config.training.teacher
-            logger.info(f"Loading teacher from {teacher_config.checkpoint_path}")
+            logger.info(
+                f"Loading teacher from {teacher_config.checkpoint_path}"
+            )
             teacher_mgr = ocp.CheckpointManager(
                 teacher_config.checkpoint_path,
                 options=ocp.CheckpointManagerOptions(create=False),
@@ -206,7 +208,9 @@ class TrainingPipeline:
             )
 
             teacher_graphdef, _ = nnx.split(
-                LczeroModel(config=teacher_model_config, rngs=nnx.Rngs(params=42))
+                LczeroModel(
+                    config=teacher_model_config, rngs=nnx.Rngs(params=42)
+                )
             )
 
         logger.info("Creating training session")
@@ -233,6 +237,7 @@ class TrainingPipeline:
                 else None
             ),
             teacher_graphdef=teacher_graphdef,
+            component_grad_norm_period=self._config.training.component_grad_norm_period,
         )
 
         logger.info("Creating data loader")

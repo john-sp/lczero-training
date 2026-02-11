@@ -124,6 +124,7 @@ def train(config_filename: str) -> None:
             config.training.swa if config.training.HasField("swa") else None
         ),
         teacher_graphdef=teacher_graphdef,
+        component_grad_norm_period=config.training.component_grad_norm_period,
     )
     new_state = training.run(
         jit_state,

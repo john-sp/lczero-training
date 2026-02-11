@@ -10,6 +10,7 @@ import numpy as np
 import optax
 from flax import nnx
 from jax import tree_util
+from jax.ad_checkpoint import checkpoint as jax_checkpoint
 from jax.sharding import PartitionSpec as P
 
 from lczero_training.dataloader import DataLoader
@@ -69,12 +70,15 @@ class Training:
         loss_fn: LczeroLoss,
         swa_config: Optional[training_config_pb2.SWAConfig] = None,
         teacher_graphdef: Optional[nnx.GraphDef] = None,
+        component_grad_norm_period: int = 0,
     ):
         self.optimizer_tx = optimizer_tx
         self._swa_config = swa_config
         self._dp_sharding = None
+        self._component_grad_norm_period = component_grad_norm_period
 
         jit_kwargs: Dict[str, Any] = {"static_argnames": ("optimizer_tx",)}
+        norms_jit_kwargs: Dict[str, Any] = {}
         if jax.device_count() > 1:
             num_devices = jax.device_count()
             logger.info(
@@ -97,6 +101,29 @@ class Training:
             jit_kwargs["in_shardings"] = in_shardings
             jit_kwargs["out_shardings"] = out_shardings
 
+            # Norms function: jit_state, batch, teacher_model_state.
+            norms_jit_kwargs["in_shardings"] = (
+                replicated,
+                batch_sharding,
+                replicated,
+            )
+            norms_jit_kwargs["out_shardings"] = replicated
+
+        # Shared helper: per-sample loss used by both the train step and
+        # the optional component-norm computation.
+        def loss_for_grad(
+            model_arg: LczeroModel,
+            sample_arg: TrainingSample,
+            teacher_model_arg: Optional[LczeroModel] = None,
+        ) -> Tuple[jax.Array, Dict[str, jax.Array]]:
+            return loss_fn(model_arg, sample_arg, teacher_model_arg)
+
+        loss_vfn = jax.vmap(
+            loss_for_grad,
+            in_axes=(None, 0, None),
+            out_axes=0,
+        )
+
         @partial(jax.jit, **jit_kwargs)
         def _step(
             optimizer_tx: optax.GradientTransformation,
@@ -112,29 +139,17 @@ class Training:
                 else None
             )
 
-            def loss_for_grad(
-                model_arg: LczeroModel,
-                sample_arg: TrainingSample,
-                teacher_model_arg: Optional[LczeroModel] = None,
-            ) -> Tuple[jax.Array, Dict[str, jax.Array]]:
-                return loss_fn(model_arg, sample_arg, teacher_model_arg)
-
-            loss_vfn = jax.vmap(
-                loss_for_grad,
-                in_axes=(None, 0, None),  # (model_arg, sample_arg, teacher_model_arg)
-                out_axes=0,
-            )
-
             def mean_loss_for_grad(
                 model_arg: LczeroModel,
                 batch_arg: TrainingBatch,
                 teacher_model_arg: Optional[LczeroModel] = None,
             ) -> Tuple[jax.Array, Dict[str, jax.Array]]:
-                # vmap automatically distributes TrainingBatch over batch dimension,
-                # calling loss_for_grad with TrainingSample (single samples).
+                # vmap distributes TrainingBatch over batch dimension,
+                # calling loss_for_grad with TrainingSample (single
+                # samples).
                 per_sample_data_loss, unweighted_losses = loss_vfn(
                     model_arg,
-                    batch_arg,  # type: ignore[arg-type]
+                    batch_arg,
                     teacher_model_arg,
                 )
                 mean_loss = jnp.mean(per_sample_data_loss)
@@ -145,24 +160,6 @@ class Training:
                 model, batch, teacher_model
             )
             grad_norm = optax.global_norm(mean_grads)
-
-            def compute_single_loss_grad_norm(loss_key: str):
-                def single_loss_fn(
-                    model_arg: LczeroModel,
-                    batch_arg: TrainingBatch,
-                    teacher_model_arg: Optional[LczeroModel] = None,
-                ) -> jax.Array:
-                    _, unweighted = loss_vfn(model_arg, batch_arg, teacher_model_arg)
-                    return jnp.mean(unweighted[loss_key])
-                
-                grads = nnx.grad(single_loss_fn)(model, batch, teacher_model)
-                return optax.global_norm(grads)
-            
-            # Compute gradient norms for the two losses you care about
-            component_norms = {
-                "value/winner": compute_single_loss_grad_norm("value/winner"),
-                "policy/vanilla": compute_single_loss_grad_norm("policy/vanilla"),
-            }
 
             assert jit_state.opt_state is not None
             updates, new_opt_state = optimizer_tx.update(
@@ -183,7 +180,6 @@ class Training:
                 "loss": mean_loss,
                 "unweighted_losses": mean_unweighted,
                 "grad_norm": grad_norm,
-                "component_norms": component_norms,
             }
             return new_jit_state, metrics
 
@@ -194,6 +190,82 @@ class Training:
             ],
             _step,
         )
+
+        # Build the optional component-norm JIT function.
+        component_keys: Tuple[str, ...] = ()
+        for pl in loss_fn.policy_losses:
+            component_keys += (f"policy/{pl.metric_name}",)
+        for vl in loss_fn.value_losses:
+            component_keys += (f"value/{vl.metric_name}",)
+        for ml in loss_fn.movesleft_losses:
+            component_keys += (f"movesleft/{ml.metric_name}",)
+        for vel in loss_fn.value_error_losses:
+            component_keys += (f"value_error/{vel.metric_name}",)
+        for vcl in loss_fn.value_categorical_losses:
+            component_keys += (f"value_categorical/{vcl.metric_name}",)
+
+        if component_grad_norm_period > 0 and component_keys:
+
+            @partial(jax.jit, **norms_jit_kwargs)
+            def _compute_component_norms(
+                jit_state: JitTrainingState,
+                batch: TrainingBatch,
+                teacher_model_state: Optional[nnx.State] = None,
+            ) -> Dict[str, jax.Array]:
+                model = nnx.merge(graphdef, jit_state.model_state)
+                teacher_model = (
+                    nnx.merge(teacher_graphdef, teacher_model_state)
+                    if teacher_graphdef is not None
+                    and teacher_model_state is not None
+                    else None
+                )
+
+                # Wrap forward pass in jax.checkpoint (remat) to
+                # recompute activations during backward instead of
+                # storing them.  This minimizes peak VRAM at the
+                # cost of extra forward compute.
+                @jax_checkpoint
+                def remat_loss_vfn(
+                    model_arg: LczeroModel,
+                    batch_arg: TrainingBatch,
+                    teacher_model_arg: Optional[LczeroModel],
+                ) -> Tuple[jax.Array, Dict[str, jax.Array]]:
+                    return loss_vfn(model_arg, batch_arg, teacher_model_arg)
+
+                norms: Dict[str, jax.Array] = {}
+                for key in component_keys:
+
+                    def single_loss_fn(
+                        model_arg: LczeroModel,
+                        batch_arg: TrainingBatch,
+                        teacher_model_arg: Optional[LczeroModel] = None,
+                        _key: str = key,
+                    ) -> jax.Array:
+                        _, unweighted = remat_loss_vfn(
+                            model_arg,
+                            batch_arg,
+                            teacher_model_arg,
+                        )
+                        return jnp.mean(unweighted[_key])
+
+                    grads = nnx.grad(single_loss_fn)(
+                        model, batch, teacher_model
+                    )
+                    norms[key] = optax.global_norm(grads)
+                return norms
+
+            self._component_norms_fn: Optional[
+                Callable[
+                    [
+                        JitTrainingState,
+                        TrainingBatch,
+                        Optional[nnx.State],
+                    ],
+                    Dict[str, jax.Array],
+                ]
+            ] = _compute_component_norms
+        else:
+            self._component_norms_fn = None
 
     def update_swa(
         self, jit_state: JitTrainingState, weight: float
@@ -327,9 +399,27 @@ class Training:
         for local_step in range(num_steps):
             logger.info(f"Starting step {jit_state.step}")
             batch = self._validate_and_prepare_batch(next(datagen))
+
+            # Compute per-component gradient norms on periodic steps
+            # using a separate JIT function to avoid extra VRAM on
+            # normal steps.
+            component_norms = None
+            if (
+                self._component_norms_fn is not None
+                and self._component_grad_norm_period > 0
+                and local_step % self._component_grad_norm_period == 0
+            ):
+                component_norms = self._component_norms_fn(
+                    jit_state, batch, teacher_model_state
+                )
+
             jit_state, metrics = self.train_step(
                 self.optimizer_tx, jit_state, batch, teacher_model_state
             )
+
+            if component_norms is not None:
+                metrics["component_norms"] = component_norms
+
             step_value = int(
                 np.asarray(jax.device_get(jit_state.step)).reshape(())
             )
