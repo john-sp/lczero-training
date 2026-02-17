@@ -114,6 +114,7 @@ message WeightsSelector {
   bool policy_heads = 4;
   bool value_heads = 5;
   bool movesleft_heads = 6;
+  bool encoder_body = 7;
 }
 
 message CheckpointConfig {

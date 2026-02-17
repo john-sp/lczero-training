@@ -31,6 +31,10 @@ def is_policy_embedding_shared(path: tuple[object, ...]) -> bool:
     return "policy_embedding_shared" in map(str, path)
 
 
+def is_encoder_body(path: tuple[object, ...]) -> bool:
+    return "encoders" in map(str, path)
+
+
 def make_weights_mask(
     selector: WeightsSelector, params: nnx.State
 ) -> nnx.State:
@@ -54,6 +58,8 @@ def make_weights_mask(
         if is_value_head(path) and not selector.value_heads:
             return False
         if is_movesleft_head(path) and not selector.movesleft_heads:
+            return False
+        if is_encoder_body(path) and not selector.encoder_body:
             return False
         return True
 
