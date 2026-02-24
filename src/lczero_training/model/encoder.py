@@ -156,7 +156,7 @@ class MultiHeadAttention(nnx.Module):
         )
 
         assert (smol_gen_dense is not None) == config.HasField("smolgen")
-        self.smolgen = None
+        self.smolgen: Optional[Smolgen]
         if smol_gen_dense is not None:
             self.smolgen = Smolgen(
                 in_features=in_features,
@@ -166,6 +166,8 @@ class MultiHeadAttention(nnx.Module):
                 weight_gen_dense=smol_gen_dense,
                 rngs=rngs,
             )
+        else:
+            self.smolgen = None
 
     def __call__(self, x: jax.Array) -> jax.Array:
         q, k, v = self.q(x), self.k(x), self.v(x)
