@@ -185,7 +185,7 @@ class Training:
 
         self.train_step = cast(
             Callable[
-                [optax.GradientTransformation, JitTrainingState, TrainingBatch],
+                [optax.GradientTransformation, JitTrainingState, TrainingBatch, Optional[nnx.State]],
                 Tuple[JitTrainingState, MetricsDict],
             ],
             _step,
