@@ -94,8 +94,9 @@ class Training:
                 probabilities=dp_sharding,
                 values=dp_sharding,
             )
-            # optimizer_tx, jit_state, batch, teacher_model_state
-            in_shardings = (replicated, replicated, batch_sharding, replicated)
+            # jit_state, batch, teacher_model_state
+            # (optimizer_tx is static, so excluded from in_shardings.)
+            in_shardings = (replicated, batch_sharding, replicated)
             out_shardings = replicated
 
             jit_kwargs["in_shardings"] = in_shardings
@@ -185,7 +186,12 @@ class Training:
 
         self.train_step = cast(
             Callable[
-                [optax.GradientTransformation, JitTrainingState, TrainingBatch, Optional[nnx.State]],
+                [
+                    optax.GradientTransformation,
+                    JitTrainingState,
+                    TrainingBatch,
+                    Optional[nnx.State],
+                ],
                 Tuple[JitTrainingState, MetricsDict],
             ],
             _step,
