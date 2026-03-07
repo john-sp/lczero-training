@@ -1,5 +1,6 @@
 import dataclasses
 import logging
+from datetime import datetime
 from functools import partial
 from typing import Any, Callable, Dict, Generator, Optional, Tuple, cast
 
@@ -77,8 +78,10 @@ class Training:
         self._dp_sharding = None
         self._component_grad_norm_period = component_grad_norm_period
 
-        jit_kwargs: Dict[str, Any] = {"static_argnames": ("optimizer_tx",)}
-        norms_jit_kwargs: Dict[str, Any] = {}
+        jit_kwargs: Dict[str, Any] = {
+            "static_argnames": ("optimizer_tx",),
+            "donate_argnames": ("jit_state",),
+        }
         if jax.device_count() > 1:
             num_devices = jax.device_count()
             logger.info(
@@ -272,6 +275,17 @@ class Training:
             ] = _compute_component_norms
         else:
             self._component_norms_fn = None
+    @staticmethod
+    @jax.jit
+    def _swa_tree_map(
+        alpha: jax.Array,
+        beta: jax.Array,
+        swa_state: nnx.State,
+        model_state: nnx.State,
+    ) -> nnx.State:
+        return tree_util.tree_map(
+            lambda a, b: alpha * a + beta * b, swa_state, model_state
+        )
 
     def update_swa(
         self, jit_state: JitTrainingState, weight: float
@@ -292,8 +306,9 @@ class Training:
         denom = jit_state.num_averages + weight
         alpha = jit_state.num_averages / denom
         beta = weight / denom
-        new_swa_state = tree_util.tree_map(
-            lambda a, b: alpha * a + beta * b,
+        new_swa_state = self._swa_tree_map(
+            jnp.array(alpha),
+            jnp.array(beta),
             jit_state.swa_state,
             jit_state.model_state,
         )
@@ -400,6 +415,7 @@ class Training:
         num_steps: int,
         step_hook: Optional[StepHook] = None,
         teacher_model_state: Optional[nnx.State] = None,
+        memory_profile_dir: Optional[str] = None,
     ) -> JitTrainingState:
         assert jit_state.opt_state is not None
         if self._dp_sharding is not None:
@@ -407,6 +423,12 @@ class Training:
             jit_state = jax.device_put(jit_state, replicated)
         for local_step in range(num_steps):
             logger.info(f"Starting step {jit_state.step}")
+            if memory_profile_dir is not None:
+                jax.profiler.save_device_memory_profile(
+                    f"{memory_profile_dir}/"
+                    f"{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+                    f"_before_{int(jit_state.step)}.prof"
+                )
             batch = self._validate_and_prepare_batch(next(datagen))
 
             # Compute per-component gradient norms on periodic steps

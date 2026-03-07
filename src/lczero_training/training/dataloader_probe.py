@@ -4,7 +4,7 @@ import logging
 import time
 from contextlib import suppress
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Optional
 
 import numpy as np
 from google.protobuf import text_format
@@ -20,38 +20,7 @@ def _stop_loader(loader: DataLoader) -> None:
         loader.stop()
 
 
-def _materialize_batch(batch: Any) -> dict:
-    if isinstance(batch, tuple):
-        if len(batch) != 3:
-            raise ValueError(
-                f"Expected tuple of 3 tensors, got {len(batch)}"
-            )
-        return {
-            "inputs": batch[0],
-            "probabilities": batch[1],
-            "values": batch[2],
-        }
-
-    expected_fields = ["inputs", "probabilities", "values"]
-    available_fields = [
-        name for name in dir(batch) if not name.startswith("_")
-    ]
-    missing_fields = [
-        name for name in expected_fields if not hasattr(batch, name)
-    ]
-    if missing_fields:
-        logger.info(
-            "Batch fields: %s",
-            ", ".join(sorted(available_fields)),
-        )
-    return {
-        "inputs": getattr(batch, "inputs", None),
-        "probabilities": getattr(batch, "probabilities", None),
-        "values": getattr(batch, "values", None),
-    }
-
-
-def _store_batches(path: str, batches: List[Any]) -> None:
+def _store_batches(path: str, batches: list) -> None:
     output = Path(path)
     if output.parent:
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -83,7 +52,7 @@ def probe_dataloader(
     logger.info("Creating data loader")
     loader = make_dataloader(config.data_loader)
 
-    collected_batches: List[Any] = []
+    collected_batches: list = []
     collect_enabled = npz_output is not None
     first_batch_time = 0.0
     remaining_batches = num_batches - 1
@@ -92,7 +61,7 @@ def probe_dataloader(
         start_time = time.perf_counter()
         first_batch = loader.get_next()
         if collect_enabled:
-            collected_batches.append(_materialize_batch(first_batch))
+            collected_batches.append(first_batch)
         first_batch_time = time.perf_counter() - start_time
         logger.info("Time to first batch: %.3f seconds", first_batch_time)
 
@@ -108,7 +77,7 @@ def probe_dataloader(
         for _ in range(remaining_batches):
             batch = loader.get_next()
             if collect_enabled:
-                collected_batches.append(_materialize_batch(batch))
+                collected_batches.append(batch)
         throughput_duration = time.perf_counter() - throughput_start
 
         if throughput_duration <= 0:
