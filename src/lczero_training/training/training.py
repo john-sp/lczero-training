@@ -82,6 +82,16 @@ class Training:
             "static_argnames": ("optimizer_tx",),
             "donate_argnames": ("jit_state",),
         }
+
+        # The component-norm computation only reads its arguments and
+        # returns gradient norms.  We subsequently pass the same
+        # `jit_state`/`batch`/`teacher_model_state` to the real train
+        # step, so nothing here may be donated.  There are also no
+        # static arguments: all values change each call.
+        norms_jit_kwargs: Dict[str, Any] = {
+            "static_argnames": (),
+            "donate_argnames": (),
+        }
         if jax.device_count() > 1:
             num_devices = jax.device_count()
             logger.info(
