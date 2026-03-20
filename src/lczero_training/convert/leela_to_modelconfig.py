@@ -72,7 +72,28 @@ def leela_to_modelconfig(
     model_config.encoder.num_blocks = len(weights.encoder)
     assert model_config.encoder.num_blocks > 0
     encoder = weights.encoder[0]
-    model_config.encoder.d_model = size(encoder.mha.q_b)
+    if not encoder.HasField("ln1_betas"):
+        model_config.defaults.norm_type = model_config_pb2.NORM_RMS_NORM
+
+    if encoder.mha.HasField("q_b"):
+        model_config.encoder.d_model = size(encoder.mha.q_b)
+        model_config.encoder.use_bias_q = True
+    else:
+        model_config.encoder.d_model = size(encoder.mha.q_w) // model_config.embedding.embedding_size
+        model_config.encoder.use_bias_q = False
+
+    model_config.encoder.heads = weights.headcount
+    head_depth = model_config.encoder.d_model // model_config.encoder.heads
+
+    model_config.encoder.use_bias_k = encoder.mha.HasField("k_b")
+    model_config.encoder.use_bias_v = encoder.mha.HasField("v_b")
+    model_config.encoder.use_q_scale = encoder.mha.HasField("q_scale")
+
+    if encoder.mha.HasField("k_b"):
+        model_config.encoder.kv_heads = size(encoder.mha.k_b) // head_depth
+    else:
+        model_config.encoder.kv_heads = (size(encoder.mha.k_w) // model_config.embedding.embedding_size) // head_depth
+
     model_config.encoder.heads = weights.headcount
     model_config.encoder.dff = size(encoder.ffn.dense1_b)
 

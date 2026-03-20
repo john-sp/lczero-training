@@ -144,6 +144,15 @@ class LczeroLoss:
             unweighted_losses[f"policy/{policy_loss.metric_name}"] = loss
             weighted_losses.append(loss * policy_loss.weight)
 
+            if policy_loss.head_name == "vanilla":
+
+                masked_accuracy = policy_loss.compute_masked_accuracy(
+                    predictions, sample
+                )
+                unweighted_losses[
+                    f"policy/{policy_loss.metric_name}/accuracy"
+                ] = masked_accuracy
+
         for value_loss in self.value_losses:
             loss = value_loss(predictions, sample)
             unweighted_losses[f"value/{value_loss.metric_name}"] = loss
@@ -274,6 +283,24 @@ class PolicyLoss(LossBase):
 
         # Compute weight.
         return jax.nn.sigmoid((z - self.opt_strength) * self.opt_alpha)
+    def compute_masked_accuracy(
+        self,
+        predictions: ModelPrediction,
+        sample: TrainingSample,
+    ) -> jax.Array:
+        """Compute policy accuracy with illegal moves masked out."""
+        policy_pred = predictions.policy[self.head_name]
+        policy_targets = jnp.asarray(
+            sample.probabilities, dtype=policy_pred.dtype
+        )
+        policy_pred = jnp.where(policy_targets >= 0, policy_pred, -1.0e10)
+        policy_targets = jax.nn.relu(policy_targets)
+
+        target_move = jnp.argmax(policy_targets, axis=-1)
+        predicted_move = jnp.argmax(policy_pred, axis=-1)
+        correct = jnp.equal(target_move, predicted_move).astype(jnp.float32)
+
+        return correct
 
     def __call__(
         self,

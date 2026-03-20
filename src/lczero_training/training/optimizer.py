@@ -3,6 +3,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 import optax
+import optax.contrib
 from flax import nnx
 
 from lczero_training.training.utils import make_weights_mask
@@ -64,6 +65,22 @@ def make_gradient_transformation(
             lr_schedule,
             momentum=sgd.momentum if sgd.momentum else None,
             nesterov=sgd.nesterov,
+        )
+    elif config.HasField("muon"):
+        muon = config.muon
+        tx = optax.contrib.muon(
+            learning_rate=lr_schedule,
+            ns_steps=muon.ns_steps,
+            beta=muon.beta,
+            eps=muon.epsilon,
+            weight_decay=muon.weight_decay,
+            weight_decay_mask=partial(make_weights_mask, muon.decay_selector),
+            nesterov=muon.nesterov,
+            adaptive=muon.adaptive,
+            adam_b1=muon.adam_beta_1,
+            adam_b2=muon.adam_beta_2,
+            adam_eps_root=muon.adam_epsilon_root,
+            adam_weight_decay=muon.adam_weight_decay,
         )
     else:
         raise ValueError(

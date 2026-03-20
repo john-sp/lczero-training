@@ -4,6 +4,7 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.nn import mish
 
+from proto import model_config_pb2
 from proto import net_pb2
 from proto.hlo_pb2 import XlaShapeProto
 
@@ -48,3 +49,10 @@ def get_dtype(dtype: XlaShapeProto.Type) -> jnp.dtype:
         XlaShapeProto.C64: jnp.complex64,
         XlaShapeProto.C128: jnp.complex128,
     }[dtype]
+
+
+def get_norm_layer(norm_type: model_config_pb2.NormType) -> Any:
+    if norm_type == model_config_pb2.NORM_RMS_NORM:
+        return nnx.RMSNorm
+    return nnx.LayerNorm
+

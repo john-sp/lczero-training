@@ -5,6 +5,12 @@ import "proto/hlo.proto";
 
 package lczero.training;
 
+
+enum NormType {
+  NORM_LAYER_NORM = 0;
+  NORM_RMS_NORM = 1;
+}
+
 message ModelConfig {
   optional DefaultsConfig defaults = 4;
   optional EmbeddingConfig embedding = 5;
@@ -18,7 +24,8 @@ message ModelConfig {
 message DefaultsConfig {
   optional pblczero.XlaShapeProto.Type compute_dtype = 2;
   optional pblczero.NetworkFormat.ActivationFunction activation = 4;
-  optional pblczero.NetworkFormat.ActivationFunction ffn_activation = 5;
+  optional pblczero.NetworkFormat.ActivationFunction ffn_activation = 5;  
+  optional NormType norm_type = 6;
 }
 
 message EmbeddingConfig {
@@ -33,6 +40,10 @@ message EncoderConfig {
   optional uint32 d_model = 5;
   optional uint32 heads = 6;
   optional SmolgenConfig smolgen = 9;
+  optional bool use_bias_q = 10 [default = true];
+  optional bool use_bias_k = 11 [default = true];
+  optional bool use_bias_v = 12 [default = true];
+  optional uint32 kv_heads = 13;
 }
 
 message SmolgenConfig {
@@ -40,6 +51,8 @@ message SmolgenConfig {
   optional uint32 hidden_size = 2;
   optional uint32 gen_size = 3;
   optional pblczero.NetworkFormat.ActivationFunction activation = 5;
+  optional bool use_bias_dense1 = 6 [default = true];
+  optional bool use_bias_dense2 = 7 [default = true];
 }
 
 message PolicyHeadConfig {

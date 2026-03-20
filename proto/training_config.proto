@@ -25,7 +25,8 @@ message OptimizerConfig {
   oneof optimizer_type {
     NadamwOptimizerConfig nadamw = 1;
     NadamOptimizerConfig nadam = 2;
-    SgdOptimizerConfig sgd = 3;
+    SgdOptimizerConfig sgd = 3;    
+    MuonOptimizerConfig muon = 5;
   }
   // When set, weights selected by this selector are frozen (no gradient
   // updates).
@@ -70,6 +71,20 @@ message NadamOptimizerConfig {
 message SgdOptimizerConfig {
   float momentum = 1;
   bool nesterov = 2;
+}
+
+message MuonOptimizerConfig {
+  int32 ns_steps = 1;
+  float beta = 2;
+  float epsilon = 3;
+  float weight_decay = 4;
+  bool nesterov = 5;
+  bool adaptive = 6;
+  float adam_beta_1 = 7;
+  float adam_beta_2 = 8;
+  float adam_epsilon_root = 9;
+  float adam_weight_decay = 10;
+  WeightsSelector decay_selector = 11;
 }
 
 message WeightsSelectorRule {

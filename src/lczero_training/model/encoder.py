@@ -9,7 +9,7 @@ from flax.linen import initializers as flax_initializers
 from proto import model_config_pb2
 
 from .shared import Ffn
-from .utils import get_activation
+from .utils import get_activation, get_norm_layer
 
 
 class EncoderTower(nnx.Module):
@@ -72,9 +72,10 @@ class EncoderBlock(nnx.Module):
             deepnorm_beta=deepnorm_beta,
             rngs=rngs,
         )
+        norm_layer = get_norm_layer(defaults.norm_type)
 
         self.alpha = math.pow(2.0 * config.num_blocks, -0.25)
-        self.ln1 = nnx.LayerNorm(in_features, epsilon=1e-3, rngs=rngs)
+        self.ln1 = norm_layer(in_features, epsilon=1e-3, rngs=rngs)
         self.ffn = Ffn(
             in_features=in_features,
             hidden_features=config.dff,
@@ -82,7 +83,7 @@ class EncoderBlock(nnx.Module):
             deepnorm_beta=deepnorm_beta,
             rngs=rngs,
         )
-        self.ln2 = nnx.LayerNorm(in_features, epsilon=1e-3, rngs=rngs)
+        self.ln2 = norm_layer(in_features, epsilon=1e-3, rngs=rngs)
 
     def __call__(self, x: jax.Array) -> jax.Array:
         x = x + self.mha(x) * self.alpha
@@ -111,11 +112,18 @@ class MultiHeadAttention(nnx.Module):
         self.activation = defaults.activation
         self.depth = depth
         self.num_heads = config.heads
+
+        self.kv_heads = (
+            config.kv_heads if config.HasField("kv_heads") else config.heads
+        )
+        assert self.num_heads % self.kv_heads == 0
+        head_depth = depth // self.num_heads
+
         self.q = nnx.Linear(
-            in_features=in_features, out_features=depth, rngs=rngs
+            in_features=in_features, out_features=depth, rngs=rngs, use_bias=config.use_bias_q
         )
         self.k = nnx.Linear(
-            in_features=in_features, out_features=depth, rngs=rngs
+            in_features=in_features, out_features=self.kv_heads * head_depth, use_bias=config.use_bias_k, rngs=rngs
         )
         deepnorm_init = flax_initializers.variance_scaling(
             scale=deepnorm_beta,
@@ -125,7 +133,8 @@ class MultiHeadAttention(nnx.Module):
 
         self.v = nnx.Linear(
             in_features=in_features,
-            out_features=depth,
+            out_features=self.kv_heads * head_depth,
+            use_bias=config.use_bias_v,
             kernel_init=deepnorm_init,
             rngs=rngs,
         )
@@ -155,10 +164,14 @@ class MultiHeadAttention(nnx.Module):
 
         head_depth = self.depth // self.num_heads
         # Reshape for multi-head attention.
-        q, k, v = (
-            t.reshape((-1, self.num_heads, head_depth)).transpose((1, 0, 2))
-            for t in (q, k, v)
-        )
+        q = q.reshape((-1, self.num_heads, head_depth)).transpose((1, 0, 2))
+        k = k.reshape((-1, self.kv_heads, head_depth)).transpose((1, 0, 2))
+        v = v.reshape((-1, self.kv_heads, head_depth)).transpose((1, 0, 2))
+
+        if self.kv_heads != self.num_heads:
+            group_size = self.num_heads // self.kv_heads
+            k = jnp.repeat(k, group_size, axis=0)
+            v = jnp.repeat(v, group_size, axis=0)
 
         # Scaled dot-product attention.
         logits = jnp.einsum("...qd,...kd->...qk", q, k)
@@ -202,6 +215,7 @@ class Smolgen(nnx.Module):
             out_features=config.hidden_size,
             rngs=rngs,
         )
+        # Don't use RMSNorm in Smolgen.
         self.ln1 = nnx.LayerNorm(config.hidden_size, epsilon=1e-3, rngs=rngs)
 
         self.dense2 = nnx.Linear(
