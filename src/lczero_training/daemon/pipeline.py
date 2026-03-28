@@ -250,6 +250,7 @@ class TrainingPipeline:
             num_heads=self._training_state.num_heads,
             license=None,
             ffn_activation=self._config.model.defaults.ffn_activation,
+            training_steps=self._training_state.jit_state.step,
         )
         export_state = (
             self._training_state.jit_state.swa_state

@@ -100,6 +100,7 @@ def train(config_filename: str) -> None:
             num_heads=training_state.num_heads,
             license=None,
             ffn_activation=config.model.defaults.ffn_activation,
+            training_steps=new_state.step,
         )
         export_state = (
             new_state.swa_state
