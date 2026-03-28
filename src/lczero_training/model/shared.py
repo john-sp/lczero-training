@@ -30,6 +30,17 @@ class Ffn(nnx.Module):
             rngs=rngs,
         )
         self.activation = hidden_activation
+        self.linear_gate: nnx.Linear | None
+        if self.activation == net_pb2.NetworkFormat.ACTIVATION_SWIGLU:
+            self.linear_gate = nnx.Linear(
+                in_features=in_features,
+                out_features=hidden_features,
+                use_bias=False,
+                kernel_init=deepnorm_init,
+                rngs=rngs,
+            )
+        else:
+            self.linear_gate = None
         self.linear2 = nnx.Linear(
             in_features=hidden_features,
             out_features=out_features,
@@ -38,7 +49,12 @@ class Ffn(nnx.Module):
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
+        if self.activation == net_pb2.NetworkFormat.ACTIVATION_SWIGLU:
+            assert self.linear_gate is not None
+            gate = nnx.sigmoid(self.linear_gate(x))
+            hidden = self.linear1(x)
+            return self.linear2(gate * hidden)
+
         x = self.linear1(x)
         x = get_activation(self.activation)(x)
-        x = self.linear2(x)
-        return x
+        return self.linear2(x)

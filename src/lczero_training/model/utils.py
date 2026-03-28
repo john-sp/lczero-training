@@ -55,4 +55,3 @@ def get_norm_layer(norm_type: model_config_pb2.NormType) -> Any:
     if norm_type == model_config_pb2.NORM_RMS_NORM:
         return nnx.RMSNorm
     return nnx.LayerNorm
-

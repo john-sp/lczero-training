@@ -184,6 +184,7 @@ def leela_to_jax_files(
             min_version=min_version,
             num_heads=lc0_weights.weights.headcount,
             license=license_str,
+            ffn_activation=lc0_weights.format.network_format.ffn_activation,
             training_steps=lc0_weights.training_params.training_steps,
         )
         verification_net = jax_to_leela(state, export_options)

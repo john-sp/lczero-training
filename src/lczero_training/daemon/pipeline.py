@@ -249,6 +249,7 @@ class TrainingPipeline:
             min_version="0.31",
             num_heads=self._training_state.num_heads,
             license=None,
+            ffn_activation=self._config.model.defaults.ffn_activation,
         )
         export_state = (
             self._training_state.jit_state.swa_state

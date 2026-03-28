@@ -96,6 +96,7 @@ def jax2leela(
         min_version=min_version,
         num_heads=restored_state.num_heads,
         license=None,
+        ffn_activation=config.model.defaults.ffn_activation,
         training_steps=restored_state.jit_state.step,
     )
 
