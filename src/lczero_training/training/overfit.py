@@ -23,7 +23,10 @@ from lczero_training.training.state import (
     TrainingSample,
     TrainingState,
 )
-from lczero_training.training.training import Training
+from lczero_training.training.training import (
+    Training,
+    advanced_metrics_options_from_config,
+)
 from proto.root_config_pb2 import RootConfig
 
 logger = logging.getLogger(__name__)
@@ -124,6 +127,9 @@ def overfit(
         optimizer_tx=optimizer_tx,
         graphdef=graphdef,
         loss_fn=loss_fn,
+        optimizer_config=config.training.optimizer,
+        lr_schedule=lr_sched,
+        advanced_metrics=advanced_metrics_options_from_config(config.training),
     )
     eval_step = _make_eval_step(graphdef, loss_fn)
 

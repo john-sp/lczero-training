@@ -14,6 +14,20 @@ message TrainingConfig {
   // Stochastic Weight Averaging (SWA) configuration. When absent, SWA is
   // disabled.
   SWAConfig swa = 7;
+  // Controls advanced training diagnostics logged to TensorBoard.
+  AdvancedMetricsConfig advanced_metrics = 8;
+}
+
+message AdvancedMetricsConfig {
+  // Interval for expensive diagnostics (gradient conflict and effective-rank
+  // checks). Defaults to 100 when unset or 0.
+  uint32 expensive_metrics_period = 1;
+  optional bool enable_weight_decay_ratios = 2;
+  optional bool enable_update_to_weight_ratio = 3;
+  optional bool enable_auxiliary_loss_ratio = 4;
+  optional bool enable_gradient_conflict_ratio = 5;
+  optional bool enable_policy_entropy_logit_scale = 6;
+  optional bool enable_ln2_collapse_diagnostics = 7;
 }
 
 message ScheduleConfig {

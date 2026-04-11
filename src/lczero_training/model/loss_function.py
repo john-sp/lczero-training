@@ -127,6 +127,43 @@ class LczeroLoss:
         _validate_no_duplicate_metrics(
             "regularization", self.regularization_losses
         )
+        self._loss_weights: Dict[str, float] = {}
+        for policy_loss in self.policy_losses:
+            self._loss_weights[f"policy/{policy_loss.metric_name}"] = (
+                policy_loss.weight
+            )
+        for value_loss in self.value_losses:
+            self._loss_weights[f"value/{value_loss.metric_name}"] = (
+                value_loss.weight
+            )
+        for movesleft_loss in self.movesleft_losses:
+            self._loss_weights[f"movesleft/{movesleft_loss.metric_name}"] = (
+                movesleft_loss.weight
+            )
+        for value_error_loss in self.value_error_losses:
+            self._loss_weights[f"value_error/{value_error_loss.metric_name}"] = (
+                value_error_loss.weight
+            )
+        for value_categorical_loss in self.value_categorical_losses:
+            self._loss_weights[
+                f"value_categorical/{value_categorical_loss.metric_name}"
+            ] = value_categorical_loss.weight
+        for reg_loss in self.regularization_losses:
+            self._loss_weights[f"regularization/{reg_loss.metric_name}"] = (
+                reg_loss.weight
+            )
+
+    @property
+    def loss_weights(self) -> Dict[str, float]:
+        return dict(self._loss_weights)
+
+    def weighted_losses(
+        self, unweighted_losses: Dict[str, jax.Array]
+    ) -> Dict[str, jax.Array]:
+        return {
+            key: value * self._loss_weights.get(key, 1.0)
+            for key, value in unweighted_losses.items()
+        }
 
     def __call__(
         self,
