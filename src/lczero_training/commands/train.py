@@ -20,7 +20,11 @@ from lczero_training.model.model import LczeroModel
 from lczero_training.training.lr_schedule import make_lr_schedule
 from lczero_training.training.optimizer import make_gradient_transformation
 from lczero_training.training.state import TrainingState
-from lczero_training.training.training import Training, from_dataloader
+from lczero_training.training.training import (
+    Training,
+    advanced_metrics_options_from_config,
+    from_dataloader,
+)
 from proto.root_config_pb2 import RootConfig
 
 
@@ -109,20 +113,22 @@ def train(config_filename: str) -> None:
         l2_regularization=getattr(config.training, "l2_regularization", 0.0),
         lr_schedule=lr_sched,
     )
+    loss_fn = LczeroLoss(
+        config=config.training.losses,
+        teacher_config=(
+            config.training.teacher if config.training.HasField("teacher") else None
+        ),
+    )
     training = Training(
         optimizer_tx=optimizer_tx,
         graphdef=model,
-        loss_fn=LczeroLoss(
-            config=config.training.losses,
-            teacher_config=(
-                config.training.teacher
-                if config.training.HasField("teacher")
-                else None
-            ),
-        ),
+        loss_fn=loss_fn,
+        optimizer_config=config.training.optimizer,
+        lr_schedule=lr_sched,
         swa_config=(
             config.training.swa if config.training.HasField("swa") else None
         ),
+        advanced_metrics=advanced_metrics_options_from_config(config.training),
         teacher_graphdef=teacher_graphdef,
         component_grad_norm_period=config.training.component_grad_norm_period,
     )
@@ -142,6 +148,7 @@ def train(config_filename: str) -> None:
             min_version="0.28",
             num_heads=training_state.num_heads,
             license=None,
+            training_steps=new_state.step,
         )
         export_state = (
             new_state.swa_state

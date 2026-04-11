@@ -197,7 +197,13 @@ def tune_lr(
         tx = _make_optimizer_with_schedule(
             training_state, config, offset_schedule
         )
-        training = Training(optimizer_tx=tx, graphdef=model, loss_fn=loss_fn)
+        training = Training(
+            optimizer_tx=tx,
+            graphdef=model,
+            loss_fn=loss_fn,
+            optimizer_config=config.training.optimizer,
+            lr_schedule=offset_schedule,
+        )
         for i in range(steps):
             current_lr = lr_at(i)
             logger.info(

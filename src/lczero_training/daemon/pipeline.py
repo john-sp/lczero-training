@@ -28,6 +28,7 @@ from lczero_training.training.state import JitTrainingState, TrainingState
 from lczero_training.training.training import (
     StepHookData,
     Training,
+    advanced_metrics_options_from_config,
     from_dataloader,
 )
 from proto.data_loader_config_pb2 import DataLoaderConfig
@@ -237,6 +238,8 @@ class TrainingPipeline:
             ),
             graphdef=nnx.graphdef(self._model),
             loss_fn=loss_fn,
+            optimizer_config=self._config.training.optimizer,
+            lr_schedule=self._lr_schedule,
             swa_config=(
                 self._config.training.swa
                 if self._config.training.HasField("swa")
@@ -244,6 +247,9 @@ class TrainingPipeline:
             ),
             teacher_graphdef=teacher_graphdef,
             component_grad_norm_period=self._config.training.component_grad_norm_period,
+            advanced_metrics=advanced_metrics_options_from_config(
+                self._config.training
+            ),
         )
 
         logger.info("Creating data loader")
@@ -304,6 +310,7 @@ class TrainingPipeline:
             min_version="0.31",
             num_heads=self._training_state.num_heads,
             license=None,
+            training_steps=self._training_state.jit_state.step,
         )
         export_state = (
             self._training_state.jit_state.swa_state

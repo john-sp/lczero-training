@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package lczero.training;
 
+import "proto/model_config.proto";
+
 // Configuration for training algorithm and parameters.
 message TrainingConfig {
   ScheduleConfig schedule = 1;
@@ -17,12 +19,12 @@ message TrainingConfig {
   // Teacher configuration for knowledge distillation.
   TeacherConfig teacher = 8;
   // Period (in steps) for computing per-component gradient norms.
-  // 0 (default) disables the feature entirely — no extra compute or memory.
+  // 0 (default) disables the feature entirely -- no extra compute or memory.
   // When > 0, component norms are computed every N steps.
   uint32 component_grad_norm_period = 9;
+  // Controls advanced training diagnostics logged to TensorBoard.
+  AdvancedMetricsConfig advanced_metrics = 10;
 }
-
-import "proto/model_config.proto";
 
 message TeacherConfig {
   string checkpoint_path = 1;
@@ -38,6 +40,18 @@ message TeacherPolicyConfig {
   float temperature = 3;
 }
 
+message AdvancedMetricsConfig {
+  // Interval for expensive diagnostics (gradient conflict and effective-rank
+  // checks). Defaults to 100 when unset or 0.
+  uint32 expensive_metrics_period = 1;
+  optional bool enable_weight_decay_ratios = 2;
+  optional bool enable_update_to_weight_ratio = 3;
+  optional bool enable_auxiliary_loss_ratio = 4;
+  optional bool enable_gradient_conflict_ratio = 5;
+  optional bool enable_policy_entropy_logit_scale = 6;
+  optional bool enable_ln2_collapse_diagnostics = 7;
+}
+
 message ScheduleConfig {
   int32 steps_per_network = 1;
   int32 chunks_per_network = 2;
@@ -50,6 +64,9 @@ message OptimizerConfig {
     SgdOptimizerConfig sgd = 3;
     MuonOptimizerConfig muon = 4;
   }
+  // When set, weights selected by this selector are frozen (no gradient
+  // updates).
+  WeightsSelector freeze_selector = 4;
 }
 
 message LrSchedule {
