@@ -2,7 +2,16 @@ import dataclasses
 import logging
 from datetime import datetime
 from functools import partial
-from typing import Any, Callable, Dict, Generator, Optional, Sequence, Tuple, cast
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generator,
+    Optional,
+    Sequence,
+    Tuple,
+    cast,
+)
 
 import jax
 import jax.numpy as jnp
@@ -46,11 +55,13 @@ def advanced_metrics_options_from_config(
     if not config.HasField("advanced_metrics"):
         return AdvancedMetricsOptions()
     metrics = config.advanced_metrics
-    period = (
-        metrics.expensive_metrics_period
-        if metrics.expensive_metrics_period > 0
-        else 100
-    )
+    configured_period = metrics.expensive_metrics_period
+    if configured_period == -1:
+        period = -1
+    elif configured_period > 0:
+        period = configured_period
+    else:
+        period = 100
     return AdvancedMetricsOptions(
         expensive_metrics_period=period,
         enable_weight_decay_ratios=(
@@ -123,14 +134,18 @@ def _weighted_aux_ratio(
     return _safe_divide(aux, total)
 
 
-def _policy_entropy_and_logit_std(policy_logits: jax.Array) -> Tuple[jax.Array, jax.Array]:
+def _policy_entropy_and_logit_std(
+    policy_logits: jax.Array,
+) -> Tuple[jax.Array, jax.Array]:
     probs = jax.nn.softmax(policy_logits, axis=-1)
     entropy = -jnp.sum(probs * jnp.log(jnp.maximum(probs, EPS)), axis=-1)
     return jnp.mean(entropy), jnp.std(policy_logits)
 
 
 def _flatten_for_cosine(tree: Any) -> jax.Array:
-    leaves = [jnp.ravel(_get_array(leaf)) for leaf in jax.tree_util.tree_leaves(tree)]
+    leaves = [
+        jnp.ravel(_get_array(leaf)) for leaf in jax.tree_util.tree_leaves(tree)
+    ]
     if not leaves:
         return jnp.zeros((0,), dtype=jnp.float32)
     return jnp.concatenate(leaves).astype(jnp.float32)
@@ -215,14 +230,20 @@ class Training:
         self._optimizer_config = optimizer_config
         self._lr_schedule = lr_schedule
         self._advanced_metrics = advanced_metrics or AdvancedMetricsOptions()
-        self._expensive_metrics_period = max(
-            self._advanced_metrics.expensive_metrics_period, 1
+        self._expensive_metrics_disabled = (
+            self._advanced_metrics.expensive_metrics_period == -1
+        )
+        self._expensive_metrics_period = (
+            self._advanced_metrics.expensive_metrics_period
+            if not self._expensive_metrics_disabled
+            else 0
         )
         self._component_metric_keys: tuple[str, ...] = tuple(
             list(f"policy/{loss.metric_name}" for loss in loss_fn.policy_losses)
             + list(f"value/{loss.metric_name}" for loss in loss_fn.value_losses)
             + list(
-                f"movesleft/{loss.metric_name}" for loss in loss_fn.movesleft_losses
+                f"movesleft/{loss.metric_name}"
+                for loss in loss_fn.movesleft_losses
             )
             + list(
                 f"value_error/{loss.metric_name}"
@@ -400,7 +421,11 @@ class Training:
             ],
             _step,
         )
-        if component_grad_norm_period > 0 and self._component_metric_keys:
+        if (
+            not self._expensive_metrics_disabled
+            and component_grad_norm_period > 0
+            and self._component_metric_keys
+        ):
 
             @partial(jax.jit, **norms_jit_kwargs)
             def _compute_component_norms(
@@ -464,8 +489,9 @@ class Training:
                 Dict[str, jax.Array],
             ]
         ] = None
-        if self._advanced_metrics.enable_gradient_conflict_ratio or (
-            self._advanced_metrics.enable_ln2_collapse_diagnostics
+        if not self._expensive_metrics_disabled and (
+            self._advanced_metrics.enable_gradient_conflict_ratio
+            or self._advanced_metrics.enable_ln2_collapse_diagnostics
         ):
 
             @partial(jax.jit, **norms_jit_kwargs)
@@ -544,9 +570,11 @@ class Training:
                                 m, b, t, "value/winner"
                             )
                         )(model, batch, teacher_model)
-                        conflict_ratio, mean_cosine = _conflict_ratio_and_cosine(
-                            policy_grads["encoders"],
-                            value_grads["encoders"],
+                        conflict_ratio, mean_cosine = (
+                            _conflict_ratio_and_cosine(
+                                policy_grads["encoders"],
+                                value_grads["encoders"],
+                            )
                         )
                         metrics[
                             "grad_conflict/policy_vanilla_vs_value_winner/conflict_ratio"
@@ -555,7 +583,10 @@ class Training:
                             "grad_conflict/policy_vanilla_vs_value_winner/mean_cosine"
                         ] = mean_cosine
 
-                    if self._primary_component_keys and self._aux_component_keys:
+                    if (
+                        self._primary_component_keys
+                        and self._aux_component_keys
+                    ):
                         primary_grads = nnx.grad(
                             lambda m, b, t: sum_component_loss(
                                 m, b, t, self._primary_component_keys
@@ -566,16 +597,18 @@ class Training:
                                 m, b, t, self._aux_component_keys
                             )
                         )(model, batch, teacher_model)
-                        conflict_ratio, mean_cosine = _conflict_ratio_and_cosine(
-                            primary_grads["encoders"],
-                            aux_grads["encoders"],
+                        conflict_ratio, mean_cosine = (
+                            _conflict_ratio_and_cosine(
+                                primary_grads["encoders"],
+                                aux_grads["encoders"],
+                            )
                         )
                         metrics[
                             "grad_conflict/primary_vs_aux/conflict_ratio"
                         ] = conflict_ratio
-                        metrics[
-                            "grad_conflict/primary_vs_aux/mean_cosine"
-                        ] = mean_cosine
+                        metrics["grad_conflict/primary_vs_aux/mean_cosine"] = (
+                            mean_cosine
+                        )
 
                 if self._advanced_metrics.enable_ln2_collapse_diagnostics:
 
@@ -587,7 +620,9 @@ class Training:
                         return jnp.mean(x, axis=0)
 
                     outputs = jax.vmap(encoder_out)(batch.inputs)
-                    centered = outputs - jnp.mean(outputs, axis=0, keepdims=True)
+                    centered = outputs - jnp.mean(
+                        outputs, axis=0, keepdims=True
+                    )
                     cov = jnp.matmul(centered.T, centered) / jnp.maximum(
                         outputs.shape[0] - 1, 1
                     )
@@ -717,8 +752,12 @@ class Training:
         scales = jnp.asarray(final_encoder.ln2.scale.value)
         abs_scales = jnp.abs(scales)
         return {
-            "active_channel_ratio": jnp.mean((abs_scales >= 0.1).astype(jnp.float32)),
-            "near_zero_ratio": jnp.mean((abs_scales < 1e-3).astype(jnp.float32)),
+            "active_channel_ratio": jnp.mean(
+                (abs_scales >= 0.1).astype(jnp.float32)
+            ),
+            "near_zero_ratio": jnp.mean(
+                (abs_scales < 1e-3).astype(jnp.float32)
+            ),
             "channel_utilization_index": _channel_utilization_index(scales),
         }
 
@@ -906,6 +945,7 @@ class Training:
             )
             should_run_expensive = (
                 self._expensive_metrics_fn is not None
+                and self._expensive_metrics_period > 0
                 and step_value % self._expensive_metrics_period == 0
             )
             if should_run_expensive:
