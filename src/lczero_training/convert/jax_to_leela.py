@@ -66,6 +66,7 @@ class LeelaExportOptions:
     min_version: str
     num_heads: int
     license: Optional[str]
+    ffn_activation: int = net_pb2.NetworkFormat.ACTIVATION_DEFAULT
     training_steps: Optional[int] = None
 
 

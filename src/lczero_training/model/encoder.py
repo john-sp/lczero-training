@@ -72,9 +72,9 @@ class EncoderBlock(nnx.Module):
             deepnorm_beta=deepnorm_beta,
             rngs=rngs,
         )
+        norm_layer = get_norm_layer(defaults.norm_type)
 
         self.alpha = math.pow(2.0 * config.num_blocks, -0.25)
-        norm_layer = get_norm_layer(defaults.norm_type)
         self.ln1 = norm_layer(in_features, epsilon=1e-3, rngs=rngs)
         self.ffn = Ffn(
             in_features=in_features,
@@ -230,7 +230,8 @@ class Smolgen(nnx.Module):
             use_bias=config.use_bias_dense1,
             rngs=rngs,
         )
-        self.ln1 = norm_layer(config.hidden_size, epsilon=1e-3, rngs=rngs)
+        # Don't use RMSNorm in Smolgen.
+        self.ln1 = nnx.LayerNorm(config.hidden_size, epsilon=1e-3, rngs=rngs)
 
         self.dense2 = nnx.Linear(
             in_features=config.hidden_size,

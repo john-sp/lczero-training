@@ -165,6 +165,11 @@ class LeelaPytreeWeightsVisitor:
 
     def ffn(self, nnx_dict: nnx.State, ffn: net_pb2.Weights.FFN) -> None:
         self.matmul(nnx_dict["linear1"], ffn.dense1_w, ffn.dense1_b)
+        if "linear_gate" in nnx_dict:
+            assert ffn.HasField("dense_gate_w")
+            self.matmul(nnx_dict["linear_gate"], ffn.dense_gate_w, None)
+        else:
+            assert not ffn.HasField("dense_gate_w")
         self.matmul(nnx_dict["linear2"], ffn.dense2_w, ffn.dense2_b)
 
     def matmul(

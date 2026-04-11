@@ -4,7 +4,6 @@ import "proto/net.proto";
 import "proto/hlo.proto";
 
 package lczero.training;
-
 enum NormType {
   NORM_LAYER_NORM = 0;
   NORM_RMS_NORM = 1;

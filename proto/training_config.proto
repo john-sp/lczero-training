@@ -62,7 +62,7 @@ message OptimizerConfig {
     NadamwOptimizerConfig nadamw = 1;
     NadamOptimizerConfig nadam = 2;
     SgdOptimizerConfig sgd = 3;
-    MuonOptimizerConfig muon = 4;
+    MuonOptimizerConfig muon = 5;
   }
   // When set, weights selected by this selector are frozen (no gradient
   // updates).

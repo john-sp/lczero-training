@@ -4,6 +4,7 @@ from typing import Any, Union
 import jax
 import jax.numpy as jnp
 import optax
+import optax.contrib
 from flax import nnx
 
 from lczero_training.training.utils import make_weights_mask
