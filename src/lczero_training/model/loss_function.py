@@ -22,6 +22,16 @@ from proto.training_config_pb2 import (
 from .model import LczeroModel, ModelPrediction
 
 
+MASKED_POLICY_LOGIT = -1.0e10
+
+
+def mask_illegal_policy_logits(
+    policy_logits: jax.Array, policy_targets: jax.Array
+) -> jax.Array:
+    """Mask policy logits for illegal moves using training targets."""
+    return jnp.where(policy_targets >= 0, policy_logits, MASKED_POLICY_LOGIT)
+
+
 def _compute_q_from_wdl(wdl_logits: jax.Array) -> jax.Array:
     """Compute Q value from WDL logits."""
     wdl_probs = jax.nn.softmax(wdl_logits)
@@ -147,9 +157,9 @@ class LczeroLoss:
                 movesleft_loss.weight
             )
         for value_error_loss in self.value_error_losses:
-            self._loss_weights[f"value_error/{value_error_loss.metric_name}"] = (
-                value_error_loss.weight
-            )
+            self._loss_weights[
+                f"value_error/{value_error_loss.metric_name}"
+            ] = value_error_loss.weight
         for value_categorical_loss in self.value_categorical_losses:
             self._loss_weights[
                 f"value_categorical/{value_categorical_loss.metric_name}"
@@ -196,6 +206,20 @@ class LczeroLoss:
                     f"policy/{policy_loss.metric_name}/accuracy_unmasked"
                 ] = accuracy
 
+                top_3_accuracy = policy_loss.compute_top_k_accuracy(
+                    predictions, sample, k=3
+                )
+                unweighted_losses[
+                    f"policy/{policy_loss.metric_name}/top_3_accuracy_unmasked"
+                ] = top_3_accuracy
+
+                top_5_accuracy = policy_loss.compute_top_k_accuracy(
+                    predictions, sample, k=5
+                )
+                unweighted_losses[
+                    f"policy/{policy_loss.metric_name}/top_5_accuracy_unmasked"
+                ] = top_5_accuracy
+
                 masked_accuracy = policy_loss.compute_masked_accuracy(
                     predictions, sample
                 )
@@ -203,10 +227,29 @@ class LczeroLoss:
                     f"policy/{policy_loss.metric_name}/accuracy"
                 ] = masked_accuracy
 
+                masked_top_3_accuracy = policy_loss.compute_top_k_accuracy(
+                    predictions, sample, k=3, masked=True
+                )
+                unweighted_losses[
+                    f"policy/{policy_loss.metric_name}/top_3_accuracy"
+                ] = masked_top_3_accuracy
+
+                masked_top_5_accuracy = policy_loss.compute_top_k_accuracy(
+                    predictions, sample, k=5, masked=True
+                )
+                unweighted_losses[
+                    f"policy/{policy_loss.metric_name}/top_5_accuracy"
+                ] = masked_top_5_accuracy
+
         for value_loss in self.value_losses:
             loss = value_loss(predictions, sample)
             unweighted_losses[f"value/{value_loss.metric_name}"] = loss
             weighted_losses.append(loss * value_loss.weight)
+
+            accuracy = value_loss.compute_accuracy(predictions, sample)
+            unweighted_losses[f"value/{value_loss.metric_name}/accuracy"] = (
+                accuracy
+            )
 
         for movesleft_loss in self.movesleft_losses:
             loss = movesleft_loss(predictions, sample)
@@ -258,7 +301,8 @@ class LczeroLoss:
                     teacher_logits = teacher_predictions.policy[head_name]
 
                     # KL divergence for distillation
-                    # T^2 * KL(softmax(teacher_logits/T), softmax(student_logits/T))
+                    # T^2 * KL(softmax(teacher_logits/T),
+                    # softmax(student_logits/T))
                     teacher_probs = jax.nn.softmax(teacher_logits / temp)
                     teacher_probs = jax.lax.stop_gradient(teacher_probs)
 
@@ -322,6 +366,24 @@ class ValueLoss(LossBase):
         assert isinstance(value_cross_entropy, jax.Array)
         return value_cross_entropy
 
+    def compute_accuracy(
+        self,
+        predictions: ModelPrediction,
+        sample: TrainingSample,
+    ) -> jax.Array:
+        """Compute value accuracy from the predicted and target WDL classes."""
+        value_pred = predictions.value[self.head_name]
+        value_logits = value_pred[0]
+        value_q = sample.values[self.value_type, 0]
+        value_d = sample.values[self.value_type, 1]
+        value_w = (1.0 + value_q - value_d) / 2.0
+        value_l = (1.0 - value_q - value_d) / 2.0
+        value_wdl = jnp.stack([value_w, value_d, value_l], axis=-1)
+
+        target_class = jnp.argmax(value_wdl, axis=-1)
+        predicted_class = jnp.argmax(value_logits, axis=-1)
+        return jnp.equal(target_class, predicted_class).astype(jnp.float32)
+
 
 class PolicyLoss(LossBase):
     def __init__(self, config: PolicyLossConfig):
@@ -329,7 +391,8 @@ class PolicyLoss(LossBase):
         self.config = config
         if config.type == PolicyLossConfig.LOSS_TYPE_UNSPECIFIED:
             raise ValueError(
-                f"Policy loss type must be specified for head '{config.head_name}'."
+                "Policy loss type must be specified for head "
+                f"'{config.head_name}'."
             )
         self._loss_type = config.type
         temperature = config.temperature
@@ -364,6 +427,24 @@ class PolicyLoss(LossBase):
             target_sum > 0, target_sum, jnp.ones_like(target_sum)
         )
         return policy_targets / safe_sum
+
+    def _get_policy_predictions_and_targets(
+        self,
+        predictions: ModelPrediction,
+        sample: TrainingSample,
+        *,
+        masked: bool = False,
+    ) -> Tuple[jax.Array, jax.Array]:
+        policy_pred = predictions.policy[self.head_name]
+        policy_targets = jnp.asarray(
+            sample.probabilities, dtype=policy_pred.dtype
+        )
+        if masked:
+            policy_pred = mask_illegal_policy_logits(
+                policy_pred, policy_targets
+            )
+        policy_targets = jax.nn.relu(policy_targets)
+        return policy_pred, policy_targets
 
     def _compute_optimistic_weight(
         self,
@@ -403,9 +484,11 @@ class PolicyLoss(LossBase):
             sample.probabilities, dtype=policy_pred.dtype
         )
         if self.config.illegal_moves == PolicyLossConfig.MASK:
-            # Use -1e10 instead of -inf to avoid NaN in gradients when
-            # computing 0 * log(softmax(-inf)).
-            policy_pred = jnp.where(policy_targets >= 0, policy_pred, -1.0e10)
+            # Use a large negative value instead of -inf to avoid NaN in
+            # gradients when computing 0 * log(softmax(-inf)).
+            policy_pred = mask_illegal_policy_logits(
+                policy_pred, policy_targets
+            )
 
         # Zero out negative targets for illegal moves.
         policy_targets = jax.nn.relu(policy_targets)
@@ -443,18 +526,14 @@ class PolicyLoss(LossBase):
         predictions: ModelPrediction,
         sample: TrainingSample,
     ) -> jax.Array:
-        """Compute policy accuracy by comparing argmax of targets and predictions.
+        """Compute policy accuracy by comparing argmax targets and predictions.
 
         Returns:
             Scalar accuracy value (fraction of correct predictions per sample).
         """
-        policy_pred = predictions.policy[self.head_name]
-        # Extract probabilities from sample.
-        policy_targets = jnp.asarray(
-            sample.probabilities, dtype=policy_pred.dtype
+        policy_pred, policy_targets = self._get_policy_predictions_and_targets(
+            predictions, sample
         )
-        # Zero out negative targets for illegal moves.
-        policy_targets = jax.nn.relu(policy_targets)
 
         target_move = jnp.argmax(policy_targets, axis=-1)
         predicted_move = jnp.argmax(policy_pred, axis=-1)
@@ -468,18 +547,35 @@ class PolicyLoss(LossBase):
         sample: TrainingSample,
     ) -> jax.Array:
         """Compute policy accuracy with illegal moves masked out."""
-        policy_pred = predictions.policy[self.head_name]
-        policy_targets = jnp.asarray(
-            sample.probabilities, dtype=policy_pred.dtype
+        policy_pred, policy_targets = self._get_policy_predictions_and_targets(
+            predictions, sample, masked=True
         )
-        policy_pred = jnp.where(policy_targets >= 0, policy_pred, -1.0e10)
-        policy_targets = jax.nn.relu(policy_targets)
 
         target_move = jnp.argmax(policy_targets, axis=-1)
         predicted_move = jnp.argmax(policy_pred, axis=-1)
         correct = jnp.equal(target_move, predicted_move).astype(jnp.float32)
 
         return correct
+
+    def compute_top_k_accuracy(
+        self,
+        predictions: ModelPrediction,
+        sample: TrainingSample,
+        k: int,
+        *,
+        masked: bool = False,
+    ) -> jax.Array:
+        """Compute whether the target move is within the top-k predictions."""
+        policy_pred, policy_targets = self._get_policy_predictions_and_targets(
+            predictions, sample, masked=masked
+        )
+
+        target_move = jnp.argmax(policy_targets, axis=-1)
+        top_k = min(k, policy_pred.shape[-1])
+        _, top_k_moves = jax.lax.top_k(policy_pred, top_k)
+        return jnp.any(top_k_moves == target_move[..., None], axis=-1).astype(
+            jnp.float32
+        )
 
 
 class MovesLeftLoss(LossBase):

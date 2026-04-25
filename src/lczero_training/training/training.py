@@ -24,7 +24,10 @@ from jax.ad_checkpoint import checkpoint as jax_checkpoint
 from jax.sharding import PartitionSpec as P
 
 from lczero_training.dataloader import DataLoader
-from lczero_training.model.loss_function import LczeroLoss
+from lczero_training.model.loss_function import (
+    LczeroLoss,
+    mask_illegal_policy_logits,
+)
 from lczero_training.model.model import LczeroModel
 from lczero_training.training.utils import make_weights_mask
 from lczero_training.training.state import (
@@ -140,6 +143,24 @@ def _policy_entropy_and_logit_std(
     probs = jax.nn.softmax(policy_logits, axis=-1)
     entropy = -jnp.sum(probs * jnp.log(jnp.maximum(probs, EPS)), axis=-1)
     return jnp.mean(entropy), jnp.std(policy_logits)
+
+
+def _masked_policy_entropy_and_logit_std(
+    policy_logits: jax.Array,
+    policy_targets: jax.Array,
+) -> Tuple[jax.Array, jax.Array]:
+    masked_logits = mask_illegal_policy_logits(policy_logits, policy_targets)
+    probs = jax.nn.softmax(masked_logits, axis=-1)
+    entropy = -jnp.sum(probs * jnp.log(jnp.maximum(probs, EPS)), axis=-1)
+
+    legal_mask = (policy_targets >= 0).astype(policy_logits.dtype)
+    legal_count = jnp.sum(legal_mask, axis=-1)
+    safe_count = jnp.maximum(legal_count, jnp.ones_like(legal_count))
+    legal_logits = policy_logits * legal_mask
+    mean = jnp.sum(legal_logits, axis=-1) / safe_count
+    centered = (policy_logits - mean[..., None]) * legal_mask
+    variance = jnp.sum(jnp.square(centered), axis=-1) / safe_count
+    return jnp.mean(entropy), jnp.mean(jnp.sqrt(variance))
 
 
 def _flatten_for_cosine(tree: Any) -> jax.Array:
@@ -577,10 +598,12 @@ class Training:
                             )
                         )
                         metrics[
-                            "grad_conflict/policy_vanilla_vs_value_winner/conflict_ratio"
+                            "grad_conflict/"
+                            "policy_vanilla_vs_value_winner/conflict_ratio"
                         ] = conflict_ratio
                         metrics[
-                            "grad_conflict/policy_vanilla_vs_value_winner/mean_cosine"
+                            "grad_conflict/"
+                            "policy_vanilla_vs_value_winner/mean_cosine"
                         ] = mean_cosine
 
                     if (
@@ -738,9 +761,14 @@ class Training:
 
         logits = jax.vmap(vanilla_logits)(batch.inputs)
         entropy, logit_std = _policy_entropy_and_logit_std(logits)
+        masked_entropy, masked_logit_std = _masked_policy_entropy_and_logit_std(
+            logits, batch.probabilities
+        )
         return {
             "entropy": entropy,
             "logit_std": logit_std,
+            "masked_entropy": masked_entropy,
+            "masked_logit_std": masked_logit_std,
         }
 
     def _compute_ln2_scale_metrics(
@@ -811,7 +839,7 @@ class Training:
         steps_completed: int,
         total_steps: int,
     ) -> JitTrainingState:
-        """Optionally update SWA based on configured schedule and epoch progress.
+        """Optionally update SWA based on schedule and epoch progress.
 
         Returns the original jit_state when no update is scheduled.
         """
@@ -868,10 +896,14 @@ class Training:
         unweighted_losses = {
             k: float(v) for k, v in metrics["unweighted_losses"].items()
         }
+        policy_metrics = {
+            k: float(v) for k, v in metrics.get("policy_vanilla", {}).items()
+        }
         grad_norm = float(metrics["grad_norm"])
         logger.info(
             f"Step {step_value} ({local_step}/{num_steps}), Loss: {loss}, "
-            f"Unweighted losses: {unweighted_losses}, Grad norm: {grad_norm}"
+            f"Unweighted losses: {unweighted_losses}, "
+            f"Policy metrics: {policy_metrics}, Grad norm: {grad_norm}"
         )
 
     def _execute_step_hook(
@@ -949,6 +981,7 @@ class Training:
                 and step_value % self._expensive_metrics_period == 0
             )
             if should_run_expensive:
+                assert self._expensive_metrics_fn is not None
                 expensive_metrics = self._expensive_metrics_fn(
                     jit_state, batch, teacher_model_state
                 )
