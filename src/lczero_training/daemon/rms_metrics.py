@@ -82,20 +82,23 @@ def collect_rms_metrics(model: LczeroModel) -> dict[str, Any]:
     # Policy heads
     metrics["policy_heads"] = {
         name: compute_rms(nnx.state(head))
-        for name, head in model.policy_heads.items()
+        for name, head in model.policy_heads_for_metrics.items()
     }
 
     # Value heads
     metrics["value_heads"] = {
         name: compute_rms(nnx.state(head))
-        for name, head in model.value_heads.items()
+        for name, head in model.value_heads_for_metrics.items()
     }
 
     # Movesleft heads
     metrics["movesleft_heads"] = {
         name: compute_rms(nnx.state(head))
-        for name, head in model.movesleft_heads.items()
+        for name, head in model.movesleft_heads_for_metrics.items()
     }
+
+    if model.headpremap is not None:
+        metrics["headpremap"] = compute_rms(nnx.state(model.headpremap))
 
     return metrics
 

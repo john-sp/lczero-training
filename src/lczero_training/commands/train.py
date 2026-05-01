@@ -116,7 +116,9 @@ def train(config_filename: str) -> None:
     loss_fn = LczeroLoss(
         config=config.training.losses,
         teacher_config=(
-            config.training.teacher if config.training.HasField("teacher") else None
+            config.training.teacher
+            if config.training.HasField("teacher")
+            else None
         ),
     )
     training = Training(
@@ -157,7 +159,11 @@ def train(config_filename: str) -> None:
             else new_state.model_state
         )
         assert isinstance(export_state, nnx.State)
-        net = jax_to_leela(jax_weights=export_state, export_options=options)
+        net = jax_to_leela(
+            jax_weights=export_state,
+            export_options=options,
+            model_config=config.model,
+        )
         network_bytes = gzip.compress(net.SerializeToString())
 
         for destination_template in config.export.destination_filename:

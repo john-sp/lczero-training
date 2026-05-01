@@ -16,18 +16,45 @@ class LeelaPytreeWeightsVisitor:
         weights = self.leela_net.weights
         self.embedding_block(state["embedding"], weights)
         self.encoder_tower(state["encoders"], weights)
-        self.policy_heads(state, weights.policy_heads)
-        for head_name in ["winner", "q", "st"]:
-            if head_name in state["value_heads"]:
-                self.value_head(
-                    state["value_heads"][head_name],
-                    getattr(weights.value_heads, head_name),
-                )
-        for head_name in ["main"]:
-            assert head_name in state["movesleft_heads"], (
-                f"movesleft head {head_name} missing in state"
+        if "headpremap" in state:
+            self.headpremap(state["headpremap"], weights)
+            self.simple_policy_heads(state["simple_policy_heads"], weights)
+            self.simple_value_heads(state["simple_value_heads"], weights)
+            assert "main" in state["simple_movesleft_heads"], (
+                "movesleft head main missing in state"
             )
-            self.movesleft_head(state["movesleft_heads"][head_name], weights)
+            self.simple_movesleft_head(
+                state["simple_movesleft_heads"]["main"], weights
+            )
+        else:
+            self.policy_heads(state, weights.policy_heads)
+            for head_name in ["winner", "q", "st"]:
+                if head_name in state["value_heads"]:
+                    self.value_head(
+                        state["value_heads"][head_name],
+                        getattr(weights.value_heads, head_name),
+                    )
+            for head_name in ["main"]:
+                assert head_name in state["movesleft_heads"], (
+                    f"movesleft head {head_name} missing in state"
+                )
+                self.movesleft_head(
+                    state["movesleft_heads"][head_name], weights
+                )
+
+    def headpremap(self, nnx_dict: nnx.State, weights: net_pb2.Weights) -> None:
+        if "gate" in nnx_dict:
+            self.tensor(nnx_dict["gate"], weights.ip_head_map_gate)
+        self.matmul(
+            nnx_dict["per_token_reduce"],
+            weights.ip_head_map_1_w,
+            weights.ip_head_map_1_b,
+        )
+        self.matmul(
+            nnx_dict["global_project"],
+            weights.ip_head_map_2_w,
+            weights.ip_head_map_2_b,
+        )
 
     def embedding_block(
         self, nnx_dict: nnx.State, weights: net_pb2.Weights
@@ -139,6 +166,30 @@ class LeelaPytreeWeightsVisitor:
         self.matmul(nnx_dict["k"], weights.ip3_pol_w, weights.ip3_pol_b)
         self.matmul(nnx_dict["promotion_dense"], weights.ip4_pol_w, None)
 
+    def simple_policy_heads(
+        self, nnx_dict: nnx.State, weights: net_pb2.Weights
+    ) -> None:
+        for head_name in ["vanilla", "optimistic_st", "soft", "opponent"]:
+            if head_name in nnx_dict:
+                self.simple_policy_head(
+                    nnx_dict[head_name],
+                    getattr(weights.policy_heads, head_name),
+                )
+
+    def simple_policy_head(
+        self, nnx_dict: nnx.State, weights: net_pb2.Weights.PolicyHead
+    ) -> None:
+        self.matmul(
+            nnx_dict["backbone"]["dense1"],
+            weights.simple_ip1_pol_w,
+            weights.simple_ip1_pol_b,
+        )
+        self.matmul(
+            nnx_dict["backbone"]["dense2"],
+            weights.simple_ip2_pol_w,
+            weights.simple_ip2_pol_b,
+        )
+
     def value_head(
         self, nnx_dict: nnx.State, weights: net_pb2.Weights.ValueHead
     ) -> None:
@@ -156,12 +207,59 @@ class LeelaPytreeWeightsVisitor:
                 weights.ip_val_cat_b,
             )
 
+    def simple_value_heads(
+        self, nnx_dict: nnx.State, weights: net_pb2.Weights
+    ) -> None:
+        for head_name in ["winner", "q", "st"]:
+            if head_name in nnx_dict:
+                self.simple_value_head(
+                    nnx_dict[head_name], getattr(weights.value_heads, head_name)
+                )
+
+    def simple_value_head(
+        self, nnx_dict: nnx.State, weights: net_pb2.Weights.ValueHead
+    ) -> None:
+        self.matmul(
+            nnx_dict["backbone"]["dense1"],
+            weights.simple_ip1_val_w,
+            weights.simple_ip1_val_b,
+        )
+        self.matmul(
+            nnx_dict["backbone"]["dense2"],
+            weights.simple_ip2_val_w,
+            weights.simple_ip2_val_b,
+        )
+        if "error" in nnx_dict:
+            self.matmul(
+                nnx_dict["error"], weights.ip_val_err_w, weights.ip_val_err_b
+            )
+        if "categorical" in nnx_dict:
+            self.matmul(
+                nnx_dict["categorical"],
+                weights.ip_val_cat_w,
+                weights.ip_val_cat_b,
+            )
+
     def movesleft_head(
         self, nnx_dict: nnx.State, weights: net_pb2.Weights
     ) -> None:
         self.matmul(nnx_dict["embed"], weights.ip_mov_w, weights.ip_mov_b)
         self.matmul(nnx_dict["dense1"], weights.ip1_mov_w, weights.ip1_mov_b)
         self.matmul(nnx_dict["out"], weights.ip2_mov_w, weights.ip2_mov_b)
+
+    def simple_movesleft_head(
+        self, nnx_dict: nnx.State, weights: net_pb2.Weights
+    ) -> None:
+        self.matmul(
+            nnx_dict["backbone"]["dense1"],
+            weights.ip1_mov_w,
+            weights.ip1_mov_b,
+        )
+        self.matmul(
+            nnx_dict["backbone"]["dense2"],
+            weights.ip2_mov_w,
+            weights.ip2_mov_b,
+        )
 
     def ffn(self, nnx_dict: nnx.State, ffn: net_pb2.Weights.FFN) -> None:
         self.matmul(nnx_dict["linear1"], ffn.dense1_w, ffn.dense1_b)

@@ -18,6 +18,10 @@ message ModelConfig {
   repeated ValueHeadConfig value_head = 9;
   repeated MovesLeftHeadConfig movesleft_head = 10;
   optional pblczero.NetworkFormat.InputFormat input_format = 11;
+  optional HeadpremapConfig headpremap = 12;
+  repeated SimpleHeadConfig simple_value_head = 13;
+  repeated SimpleHeadConfig simple_movesleft_head = 14;
+  repeated SimpleHeadConfig simple_policy_head = 15;
 }
 
 message DefaultsConfig {
@@ -55,6 +59,12 @@ message SmolgenConfig {
   optional bool use_bias_dense2 = 7 [default = true];
 }
 
+message HeadpremapConfig {
+  optional uint32 intermediate_size = 1;
+  optional uint32 output_size = 2;
+  optional bool use_gating = 3 [default = true];
+}
+
 message PolicyHeadConfig {
   optional string name = 1;
   optional uint32 embedding_size = 2;
@@ -71,4 +81,11 @@ message ValueHeadConfig {
 message MovesLeftHeadConfig {
   optional string name = 1;
   optional uint32 num_channels = 2;
+}
+
+message SimpleHeadConfig {
+  optional string name = 1;
+  optional uint32 hidden_size = 2;
+  optional bool has_error_output = 3;
+  optional uint32 num_categorical_buckets = 4;
 }

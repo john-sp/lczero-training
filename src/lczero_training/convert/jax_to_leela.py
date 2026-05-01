@@ -113,9 +113,14 @@ def _make_format(model_config: model_config_pb2.ModelConfig) -> net_pb2.Format:
         netfmt.input = netfmt.INPUT_CLASSICAL_112_PLANE
     netfmt.output = netfmt.OUTPUT_WDL
     netfmt.network = netfmt.NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT
-    netfmt.policy = netfmt.POLICY_ATTENTION
-    netfmt.value = netfmt.VALUE_WDL
-    netfmt.moves_left = netfmt.MOVES_LEFT_V1
+    if model_config.HasField("headpremap"):
+        netfmt.policy = netfmt.POLICY_SIMPLE
+        netfmt.value = netfmt.VALUE_SIMPLE_WDL
+        netfmt.moves_left = netfmt.MOVES_LEFT_SIMPLE
+    else:
+        netfmt.policy = netfmt.POLICY_ATTENTION
+        netfmt.value = netfmt.VALUE_WDL
+        netfmt.moves_left = netfmt.MOVES_LEFT_V1
     netfmt.input_embedding = netfmt.INPUT_EMBEDDING_PE_DENSE
 
     if model_config.HasField("defaults") and model_config.defaults.HasField(

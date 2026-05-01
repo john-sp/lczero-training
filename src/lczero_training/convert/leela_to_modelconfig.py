@@ -39,22 +39,25 @@ def leela_to_modelconfig(
             leela_net_format.input_embedding
         )
     )
-    assert leela_net_format.policy == net_pb2.NetworkFormat.POLICY_ATTENTION, (
-        "Only attention policy is supported, got {}".format(
-            net_pb2.NetworkFormat.PolicyFormat.Name(leela_net_format.policy)
-        )
+    policy_format = leela_net_format.policy
+    value_format = leela_net_format.value
+    moves_left_format = leela_net_format.moves_left
+    is_simple = (
+        policy_format == net_pb2.NetworkFormat.POLICY_SIMPLE
+        and value_format == net_pb2.NetworkFormat.VALUE_SIMPLE_WDL
+        and moves_left_format == net_pb2.NetworkFormat.MOVES_LEFT_SIMPLE
     )
-    assert leela_net_format.value == net_pb2.NetworkFormat.VALUE_WDL, (
-        "Only WDL value is supported, got {}".format(
-            net_pb2.NetworkFormat.ValueFormat.Name(leela_net_format.value)
-        )
+    is_regular = (
+        policy_format == net_pb2.NetworkFormat.POLICY_ATTENTION
+        and value_format == net_pb2.NetworkFormat.VALUE_WDL
+        and moves_left_format == net_pb2.NetworkFormat.MOVES_LEFT_V1
     )
-    assert leela_net_format.moves_left == net_pb2.NetworkFormat.MOVES_LEFT_V1, (
-        "Only V1 moves left format is supported, got {}".format(
-            net_pb2.NetworkFormat.MovesLeftFormat.Name(
-                leela_net_format.moves_left
-            )
-        )
+    assert is_simple or is_regular, (
+        "Unsupported or mixed head formats: policy={}, value={}, moves_left={}"
+    ).format(
+        net_pb2.NetworkFormat.PolicyFormat.Name(policy_format),
+        net_pb2.NetworkFormat.ValueFormat.Name(value_format),
+        net_pb2.NetworkFormat.MovesLeftFormat.Name(moves_left_format),
     )
 
     def size(x: net_pb2.Weights.Layer) -> int:
@@ -81,7 +84,9 @@ def leela_to_modelconfig(
         model_config.encoder.d_model = size(encoder.mha.q_b)
         model_config.encoder.use_bias_q = True
     else:
-        model_config.encoder.d_model = size(encoder.mha.q_w) // model_config.embedding.embedding_size
+        model_config.encoder.d_model = (
+            size(encoder.mha.q_w) // model_config.embedding.embedding_size
+        )
         model_config.encoder.use_bias_q = False
 
     model_config.encoder.heads = weights.headcount
@@ -94,7 +99,9 @@ def leela_to_modelconfig(
     if encoder.mha.HasField("k_b"):
         model_config.encoder.kv_heads = size(encoder.mha.k_b) // head_depth
     else:
-        model_config.encoder.kv_heads = (size(encoder.mha.k_w) // model_config.embedding.embedding_size) // head_depth
+        model_config.encoder.kv_heads = (
+            size(encoder.mha.k_w) // model_config.embedding.embedding_size
+        ) // head_depth
 
     model_config.encoder.dff = size(encoder.ffn.dense1_b)
 
@@ -114,36 +121,75 @@ def leela_to_modelconfig(
             encoder.mha.smolgen.dense1_b
         )
 
-    if weights.policy_heads.HasField("ip_pol_w"):
-        model_config.shared_policy_embedding_size = size(
-            weights.policy_heads.ip_pol_b
+    if is_simple:
+        assert size(weights.ip_head_map_1_b) > 0
+        assert size(weights.ip_head_map_2_b) > 0
+        model_config.headpremap.intermediate_size = size(
+            weights.ip_head_map_1_b
+        )
+        model_config.headpremap.output_size = size(weights.ip_head_map_2_b)
+        model_config.headpremap.use_gating = weights.HasField(
+            "ip_head_map_gate"
         )
 
-    for head_name in ["vanilla", "optimistic_st", "soft", "opponent"]:
-        if weights.policy_heads.HasField(head_name):
-            head = getattr(weights.policy_heads, head_name)
-            assert size(head.ip2_pol_b) > 0
-            assert not head.HasField("ip_pol_w")
-            policy_head = model_config.policy_head.add()
-            policy_head.name = head_name
-            if not model_config.HasField("shared_policy_embedding_size"):
-                policy_head.embedding_size = size(head.ip_pol_b)
-            policy_head.d_model = size(head.ip2_pol_b)
+        for head_name in ["vanilla", "optimistic_st", "soft", "opponent"]:
+            if weights.policy_heads.HasField(head_name):
+                head = getattr(weights.policy_heads, head_name)
+                assert size(head.simple_ip1_pol_b) > 0
+                assert size(head.simple_ip2_pol_b) == 1858
+                policy_head = model_config.simple_policy_head.add()
+                policy_head.name = head_name
+                policy_head.hidden_size = size(head.simple_ip1_pol_b)
 
-    for head_name in ["winner", "q", "st"]:
-        if weights.value_heads.HasField(head_name):
-            head = getattr(weights.value_heads, head_name)
-            assert size(head.ip_val_b) > 0
-            value_head = model_config.value_head.add()
-            value_head.name = head_name
-            value_head.num_channels = size(head.ip_val_b)
-            if head.HasField("ip_val_err_w"):
-                value_head.has_error_output = True
-            if head.HasField("ip_val_cat_b"):
-                value_head.num_categorical_buckets = size(head.ip_val_cat_b)
+        for head_name in ["winner", "q", "st"]:
+            if weights.value_heads.HasField(head_name):
+                head = getattr(weights.value_heads, head_name)
+                assert size(head.simple_ip1_val_b) > 0
+                simple_head = model_config.simple_value_head.add()
+                simple_head.name = head_name
+                simple_head.hidden_size = size(head.simple_ip1_val_b)
+                if head.HasField("ip_val_err_w"):
+                    simple_head.has_error_output = True
+                if head.HasField("ip_val_cat_b"):
+                    simple_head.num_categorical_buckets = size(
+                        head.ip_val_cat_b
+                    )
 
-    movesleft_head = model_config.movesleft_head.add()
-    movesleft_head.name = "main"
-    movesleft_head.num_channels = size(weights.ip_mov_b)
+        assert size(weights.ip1_mov_b) > 0
+        simple_movesleft_head = model_config.simple_movesleft_head.add()
+        simple_movesleft_head.name = "main"
+        simple_movesleft_head.hidden_size = size(weights.ip1_mov_b)
+    else:
+        if weights.policy_heads.HasField("ip_pol_w"):
+            model_config.shared_policy_embedding_size = size(
+                weights.policy_heads.ip_pol_b
+            )
+
+        for head_name in ["vanilla", "optimistic_st", "soft", "opponent"]:
+            if weights.policy_heads.HasField(head_name):
+                head = getattr(weights.policy_heads, head_name)
+                assert size(head.ip2_pol_b) > 0
+                assert not head.HasField("ip_pol_w")
+                policy_head = model_config.policy_head.add()
+                policy_head.name = head_name
+                if not model_config.HasField("shared_policy_embedding_size"):
+                    policy_head.embedding_size = size(head.ip_pol_b)
+                policy_head.d_model = size(head.ip2_pol_b)
+
+        for head_name in ["winner", "q", "st"]:
+            if weights.value_heads.HasField(head_name):
+                head = getattr(weights.value_heads, head_name)
+                assert size(head.ip_val_b) > 0
+                value_head = model_config.value_head.add()
+                value_head.name = head_name
+                value_head.num_channels = size(head.ip_val_b)
+                if head.HasField("ip_val_err_w"):
+                    value_head.has_error_output = True
+                if head.HasField("ip_val_cat_b"):
+                    value_head.num_categorical_buckets = size(head.ip_val_cat_b)
+
+        movesleft_head = model_config.movesleft_head.add()
+        movesleft_head.name = "main"
+        movesleft_head.num_channels = size(weights.ip_mov_b)
 
     return model_config

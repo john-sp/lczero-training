@@ -753,7 +753,7 @@ class Training:
     ) -> Dict[str, jax.Array]:
         if not self._advanced_metrics.enable_policy_entropy_logit_scale:
             return {}
-        if "vanilla" not in model.policy_heads:
+        if "vanilla" not in model.policy_heads_for_metrics:
             return {}
 
         def vanilla_logits(sample_inputs: jax.Array) -> jax.Array:
