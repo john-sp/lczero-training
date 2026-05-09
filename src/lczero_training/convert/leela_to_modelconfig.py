@@ -1,6 +1,23 @@
-import math
-
 from proto import hlo_pb2, model_config_pb2, net_pb2
+
+def _network_structure_to_block_style(
+    network_structure: int,
+) -> int:
+    if (
+        network_structure
+        == net_pb2.NetworkFormat.NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT
+    ):
+        return model_config_pb2.EncoderConfig.ENCODER_BLOCK_STYLE_SEQUENTIAL
+    if (
+        network_structure
+        == net_pb2.NetworkFormat.NETWORK_ATTENTIONBODY_PALM_PARALLEL_WITH_MULTIHEADFORMAT
+    ):
+        return model_config_pb2.EncoderConfig.ENCODER_BLOCK_STYLE_PALM_PARALLEL
+    raise ValueError(
+        "Unsupported network structure: {}".format(
+            net_pb2.NetworkFormat.NetworkStructure.Name(network_structure)
+        )
+    )
 
 
 def _defaultactivation_to_activation(
@@ -63,9 +80,8 @@ def leela_to_modelconfig(
     def size(x: net_pb2.Weights.Layer) -> int:
         return len(x.params) // 2
 
-    assert (
+    model_config.encoder.block_style = _network_structure_to_block_style(
         leela_net_format.network
-        == net_pb2.NetworkFormat.NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT
     )
     weights = leela_net.weights
     model_config.input_format = leela_net_format.input

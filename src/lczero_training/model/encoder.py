@@ -12,6 +12,14 @@ from .shared import Ffn
 from .utils import get_activation, get_norm_layer
 
 
+_SEQUENTIAL_BLOCK_STYLE = (
+    model_config_pb2.EncoderConfig.ENCODER_BLOCK_STYLE_SEQUENTIAL
+)
+_PALM_PARALLEL_BLOCK_STYLE = (
+    model_config_pb2.EncoderConfig.ENCODER_BLOCK_STYLE_PALM_PARALLEL
+)
+
+
 class EncoderTower(nnx.Module):
     def __init__(
         self,
@@ -84,12 +92,24 @@ class EncoderBlock(nnx.Module):
             rngs=rngs,
         )
         self.ln2 = norm_layer(in_features, epsilon=1e-3, rngs=rngs)
+        self.block_style = config.block_style
+        if self.block_style not in (
+            _SEQUENTIAL_BLOCK_STYLE,
+            _PALM_PARALLEL_BLOCK_STYLE,
+        ):
+            raise ValueError(f"Unsupported block style: {self.block_style}")
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        x = x + self.mha(x) * self.alpha
-        out1 = self.ln1(x)
-        ffn_out = self.ffn(out1)
-        return self.ln2(out1 + ffn_out * self.alpha)
+        if self.block_style == _SEQUENTIAL_BLOCK_STYLE:
+            x = x + self.mha(x) * self.alpha
+            out1 = self.ln1(x)
+            ffn_out = self.ffn(out1)
+            return self.ln2(out1 + ffn_out * self.alpha)
+
+        normed = self.ln1(x)
+        attn_out = self.mha(normed)
+        ffn_out = self.ffn(normed)
+        return self.ln2(x + (attn_out + ffn_out) * self.alpha)
 
 
 class MultiHeadAttention(nnx.Module):

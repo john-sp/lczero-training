@@ -48,6 +48,12 @@ message EncoderConfig {
   optional bool use_bias_v = 12 [default = true];
   optional uint32 kv_heads = 13;
   optional bool use_q_scale = 14 [default = false];
+  enum EncoderBlockStyle {
+    ENCODER_BLOCK_STYLE_SEQUENTIAL = 0;
+    ENCODER_BLOCK_STYLE_PALM_PARALLEL = 1;
+  }
+  optional EncoderBlockStyle block_style = 15
+      [default = ENCODER_BLOCK_STYLE_SEQUENTIAL];
 }
 
 message SmolgenConfig {

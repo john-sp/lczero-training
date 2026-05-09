@@ -112,7 +112,15 @@ def _make_format(model_config: model_config_pb2.ModelConfig) -> net_pb2.Format:
     else:
         netfmt.input = netfmt.INPUT_CLASSICAL_112_PLANE
     netfmt.output = netfmt.OUTPUT_WDL
-    netfmt.network = netfmt.NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT
+    block_style = model_config.encoder.block_style
+    if block_style == model_config_pb2.EncoderConfig.ENCODER_BLOCK_STYLE_SEQUENTIAL:
+        netfmt.network = netfmt.NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT
+    elif block_style == model_config_pb2.EncoderConfig.ENCODER_BLOCK_STYLE_PALM_PARALLEL:
+        netfmt.network = (
+            netfmt.NETWORK_ATTENTIONBODY_PALM_PARALLEL_WITH_MULTIHEADFORMAT
+        )
+    else:
+        raise ValueError(f"Unsupported encoder block style: {block_style}")
     if model_config.HasField("headpremap"):
         netfmt.policy = netfmt.POLICY_SIMPLE
         netfmt.value = netfmt.VALUE_SIMPLE_WDL
