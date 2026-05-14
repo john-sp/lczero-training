@@ -73,6 +73,8 @@ class LeelaPytreeWeightsVisitor:
             nnx_dict["norm"],
             weights.ip_emb_ln_gammas,
             weights.ip_emb_ln_betas,
+            weights.ip_emb_ln_alphas,
+            weights.ip_emb_ln_shifts,
         )
         self.tensor(
             nnx_dict["ma_gating"]["mult_gate"]["gate"], weights.ip_mult_gate
@@ -85,6 +87,8 @@ class LeelaPytreeWeightsVisitor:
             nnx_dict["out_norm"],
             weights.ip_emb_ffn_ln_gammas,
             weights.ip_emb_ffn_ln_betas,
+            weights.ip_emb_ffn_ln_alphas,
+            weights.ip_emb_ffn_ln_shifts,
         )
 
     def encoder_tower(
@@ -109,9 +113,21 @@ class LeelaPytreeWeightsVisitor:
         self, nnx_dict: nnx.State, weights: net_pb2.Weights.EncoderLayer
     ) -> None:
         self.mha(nnx_dict["mha"], weights.mha)
-        self.layernorm(nnx_dict["ln1"], weights.ln1_gammas, weights.ln1_betas)
+        self.layernorm(
+            nnx_dict["ln1"],
+            weights.ln1_gammas,
+            weights.ln1_betas,
+            weights.ln1_alphas,
+            weights.ln1_shifts,
+        )
         self.ffn(nnx_dict["ffn"], weights.ffn)
-        self.layernorm(nnx_dict["ln2"], weights.ln2_gammas, weights.ln2_betas)
+        self.layernorm(
+            nnx_dict["ln2"],
+            weights.ln2_gammas,
+            weights.ln2_betas,
+            weights.ln2_alphas,
+            weights.ln2_shifts,
+        )
 
     def mha(self, nnx_dict: nnx.State, weights: net_pb2.Weights.MHA) -> None:
         self.matmul(nnx_dict["q"], weights.q_w, weights.q_b)
@@ -136,10 +152,21 @@ class LeelaPytreeWeightsVisitor:
         nnx_dict: nnx.State,
         scales: net_pb2.Weights.Layer,
         biases: net_pb2.Weights.Layer,
+        alphas: Optional[net_pb2.Weights.Layer] = None,
+        shifts: Optional[net_pb2.Weights.Layer] = None,
     ) -> None:
-        self.tensor(nnx_dict["scale"], scales)
+        if "weight" in nnx_dict:
+            self.tensor(nnx_dict["weight"], scales)
+        else:
+            self.tensor(nnx_dict["scale"], scales)
+
         if "bias" in nnx_dict:
             self.tensor(nnx_dict["bias"], biases)
+
+        if "alpha" in nnx_dict:
+            assert alphas is not None and shifts is not None
+            self.tensor(nnx_dict["alpha"], alphas)
+            self.tensor(nnx_dict["shift"], shifts)
 
     def policy_heads(
         self, nnx_dict: nnx.State, weights: net_pb2.Weights.PolicyHeads

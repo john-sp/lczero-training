@@ -1,5 +1,6 @@
 from typing import Any
 
+import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax.nn import mish
@@ -9,7 +10,40 @@ from proto import net_pb2
 from proto.hlo_pb2 import XlaShapeProto
 
 
-def get_norm_layer(norm_type: model_config_pb2.NormType) -> Any:
+class DynamicErf(nnx.Module):
+    def __init__(
+        self,
+        normalized_shape: int | tuple[int, ...],
+        epsilon: float = 1e-3,
+        alpha_init: float = 0.5,
+        shift_init: float = 0.0,
+        *,
+        rngs: nnx.Rngs,
+    ):
+        if isinstance(normalized_shape, int):
+            normalized_shape = (normalized_shape,)
+
+        self.alpha = nnx.Param(jnp.full((1,), alpha_init, dtype=jnp.float32))
+        self.shift = nnx.Param(jnp.full((1,), shift_init, dtype=jnp.float32))
+        self.weight = nnx.Param(jnp.ones(normalized_shape, dtype=jnp.float32))
+        self.bias = nnx.Param(jnp.zeros(normalized_shape, dtype=jnp.float32))
+        self.epsilon = epsilon
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        alpha = self.alpha.value.astype(x.dtype)
+        shift = self.shift.value.astype(x.dtype)
+        weight = self.weight.value.astype(x.dtype)
+        bias = self.bias.value.astype(x.dtype)
+        return weight * jax.lax.erf(alpha * x + shift) + bias
+
+
+def get_norm_layer(
+    norm_type: model_config_pb2.NormType,
+    *,
+    allow_dynamic_erf: bool = True,
+) -> Any:
+    if allow_dynamic_erf and norm_type == model_config_pb2.NORM_DYNAMIC_ERF:
+        return DynamicErf
     if norm_type == model_config_pb2.NORM_RMS_NORM:
         return nnx.RMSNorm
     return nnx.LayerNorm
@@ -55,4 +89,3 @@ def get_dtype(dtype: XlaShapeProto.Type) -> jnp.dtype:
         XlaShapeProto.C64: jnp.complex64,
         XlaShapeProto.C128: jnp.complex128,
     }[dtype]
-

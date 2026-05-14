@@ -1,5 +1,6 @@
 from proto import hlo_pb2, model_config_pb2, net_pb2
 
+
 def _network_structure_to_block_style(
     network_structure: int,
 ) -> int:
@@ -94,7 +95,44 @@ def leela_to_modelconfig(
     model_config.encoder.num_blocks = len(weights.encoder)
     assert model_config.encoder.num_blocks > 0
     encoder = weights.encoder[0]
-    if not encoder.HasField("ln1_betas"):
+    has_dynamic_erf = any(
+        block.HasField("ln1_alphas")
+        or block.HasField("ln1_shifts")
+        or block.HasField("ln2_alphas")
+        or block.HasField("ln2_shifts")
+        for block in weights.encoder
+    )
+    if has_dynamic_erf:
+        for block in weights.encoder:
+            if not block.HasField("ln1_alphas") or not block.HasField(
+                "ln1_shifts"
+            ):
+                raise ValueError(
+                    "Dynamic ERF requires both ln1_alphas and ln1_shifts "
+                    "for every encoder block."
+                )
+            if not block.HasField("ln2_alphas") or not block.HasField(
+                "ln2_shifts"
+            ):
+                raise ValueError(
+                    "Dynamic ERF requires both ln2_alphas and ln2_shifts "
+                    "for every encoder block."
+                )
+        if not weights.HasField("ip_emb_ln_alphas") or not weights.HasField(
+            "ip_emb_ln_shifts"
+        ):
+            raise ValueError(
+                "Dynamic ERF requires ip_emb_ln_alphas and ip_emb_ln_shifts."
+            )
+        if not weights.HasField("ip_emb_ffn_ln_alphas") or not weights.HasField(
+            "ip_emb_ffn_ln_shifts"
+        ):
+            raise ValueError(
+                "Dynamic ERF requires ip_emb_ffn_ln_alphas and "
+                "ip_emb_ffn_ln_shifts."
+            )
+        model_config.defaults.norm_type = model_config_pb2.NORM_DYNAMIC_ERF
+    elif not encoder.HasField("ln1_betas"):
         model_config.defaults.norm_type = model_config_pb2.NORM_RMS_NORM
     if encoder.mha.HasField("q_b"):
         model_config.encoder.d_model = size(encoder.mha.q_b)

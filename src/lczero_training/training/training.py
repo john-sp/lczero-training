@@ -117,6 +117,14 @@ def _leaf_l2_norm(tree: Any) -> jax.Array:
     return jnp.sqrt(total_sq)
 
 
+def _norm_scales(norm_layer: Any) -> jax.Array:
+    if hasattr(norm_layer, "scale"):
+        return jnp.asarray(norm_layer.scale.value)
+    if hasattr(norm_layer, "weight"):
+        return jnp.asarray(norm_layer.weight.value)
+    raise ValueError("Unsupported norm layer: missing scale/weight parameter.")
+
+
 def _safe_divide(num: jax.Array, den: jax.Array) -> jax.Array:
     return num / jnp.maximum(den, jnp.array(EPS, dtype=num.dtype))
 
@@ -661,7 +669,7 @@ class Training:
                     )
 
                     final_encoder = model.encoders.encoders.layers[-1]
-                    scales = jnp.asarray(final_encoder.ln2.scale.value)
+                    scales = _norm_scales(final_encoder.ln2)
                     active_mask = (jnp.abs(scales) >= 0.1).astype(jnp.float32)
                     channel_energy = jnp.var(outputs, axis=0)
                     active_energy = jnp.sum(channel_energy * active_mask)
@@ -777,7 +785,7 @@ class Training:
         if not self._advanced_metrics.enable_ln2_collapse_diagnostics:
             return {}
         final_encoder = model.encoders.encoders.layers[-1]
-        scales = jnp.asarray(final_encoder.ln2.scale.value)
+        scales = _norm_scales(final_encoder.ln2)
         abs_scales = jnp.abs(scales)
         return {
             "active_channel_ratio": jnp.mean(

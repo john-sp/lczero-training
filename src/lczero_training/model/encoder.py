@@ -237,7 +237,7 @@ class Smolgen(nnx.Module):
         rngs: nnx.Rngs,
     ):
         self.heads = heads
-        norm_layer = get_norm_layer(defaults.norm_type)
+        norm_layer = get_norm_layer(defaults.norm_type, allow_dynamic_erf=False)
         self.compress = nnx.Linear(
             in_features=in_features,
             out_features=config.hidden_channels,
@@ -259,9 +259,7 @@ class Smolgen(nnx.Module):
             use_bias=config.use_bias_dense2,
             rngs=rngs,
         )
-        self.ln2 = norm_layer(
-            config.gen_size * heads, epsilon=1e-3, rngs=rngs
-        )
+        self.ln2 = norm_layer(config.gen_size * heads, epsilon=1e-3, rngs=rngs)
         self.weight_gen_dense = weight_gen_dense
         self.activation = config.activation or defaults.activation
 
