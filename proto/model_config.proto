@@ -55,6 +55,16 @@ message EncoderConfig {
   }
   optional EncoderBlockStyle block_style = 15
       [default = ENCODER_BLOCK_STYLE_SEQUENTIAL];
+  repeated EncoderLayerOverride layer_override = 16;
+}
+
+message EncoderLayerOverride {
+  optional uint32 start_layer = 1;
+  optional uint32 end_layer = 2;
+  optional uint32 dff = 3;
+  optional uint32 heads = 4;
+  optional uint32 kv_heads = 5;
+  optional SmolgenConfig smolgen = 6;
 }
 
 message SmolgenConfig {

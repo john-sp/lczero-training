@@ -20,6 +20,84 @@ _PALM_PARALLEL_BLOCK_STYLE = (
 )
 
 
+class _LayerConfig:
+    def __init__(
+        self,
+        *,
+        dff: int,
+        heads: int,
+        kv_heads: int,
+        smolgen: Optional[model_config_pb2.SmolgenConfig],
+    ):
+        self.dff = dff
+        self.heads = heads
+        self.kv_heads = kv_heads
+        self.smolgen = smolgen
+
+
+def _build_layer_configs(
+    config: model_config_pb2.EncoderConfig,
+) -> list[_LayerConfig]:
+    layer_configs = [
+        _LayerConfig(
+            dff=config.dff,
+            heads=config.heads,
+            kv_heads=config.kv_heads
+            if config.HasField("kv_heads")
+            else config.heads,
+            smolgen=config.smolgen if config.HasField("smolgen") else None,
+        )
+        for _ in range(config.num_blocks)
+    ]
+    seen = [False] * config.num_blocks
+    base_gen_size = (
+        config.smolgen.gen_size if config.HasField("smolgen") else None
+    )
+    for override in config.layer_override:
+        if not override.HasField("start_layer") or not override.HasField(
+            "end_layer"
+        ):
+            raise ValueError(
+                "layer_override requires start_layer and end_layer."
+            )
+        start = override.start_layer
+        end = override.end_layer
+        if start > end:
+            raise ValueError("layer_override start_layer must be <= end_layer.")
+        if end >= config.num_blocks:
+            raise ValueError("layer_override range exceeds num_blocks.")
+        for idx in range(start, end + 1):
+            if seen[idx]:
+                raise ValueError("Overlapping layer_override ranges are invalid.")
+            seen[idx] = True
+            layer_config = layer_configs[idx]
+            if override.HasField("dff"):
+                layer_config.dff = override.dff
+            if override.HasField("heads"):
+                layer_config.heads = override.heads
+            if override.HasField("kv_heads"):
+                layer_config.kv_heads = override.kv_heads
+            if override.HasField("smolgen"):
+                if base_gen_size is None:
+                    raise ValueError(
+                        "smolgen overrides require encoder.smolgen to be set."
+                    )
+                if (
+                    override.smolgen.HasField("gen_size")
+                    and override.smolgen.gen_size != base_gen_size
+                ):
+                    raise ValueError(
+                        "smolgen.gen_size cannot vary by layer."
+                    )
+                layer_config.smolgen = override.smolgen
+    for layer_config in layer_configs:
+        if layer_config.kv_heads <= 0:
+            raise ValueError("kv_heads must be greater than zero.")
+        if layer_config.heads % layer_config.kv_heads != 0:
+            raise ValueError("heads must be divisible by kv_heads.")
+    return layer_configs
+
+
 class EncoderTower(nnx.Module):
     def __init__(
         self,
@@ -30,8 +108,8 @@ class EncoderTower(nnx.Module):
         deepnorm_beta: float,
         rngs: nnx.Rngs,
     ):
+        layer_configs = _build_layer_configs(config)
         smolgen_shared_gen_dense = None
-        assert config.HasField("smolgen")
         if config.HasField("smolgen"):
             smolgen_shared_gen_dense = nnx.Linear(
                 in_features=config.smolgen.gen_size,
@@ -45,12 +123,13 @@ class EncoderTower(nnx.Module):
                 EncoderBlock(
                     in_features=in_features,
                     config=config,
+                    layer_config=layer_config,
                     defaults=defaults,
                     smol_gen_dense=smolgen_shared_gen_dense,
                     deepnorm_beta=deepnorm_beta,
                     rngs=rngs,
                 )
-                for _ in range(config.num_blocks)
+                for layer_config in layer_configs
             ]
         )
 
@@ -66,15 +145,23 @@ class EncoderBlock(nnx.Module):
         *,
         in_features: int,
         config: model_config_pb2.EncoderConfig,
+        layer_config: _LayerConfig,
         defaults: model_config_pb2.DefaultsConfig,
         smol_gen_dense: Optional[nnx.Linear],
         deepnorm_beta: float,
         rngs: nnx.Rngs,
     ):
-        assert (smol_gen_dense is not None) == config.HasField("smolgen")
+        assert (smol_gen_dense is not None) == (layer_config.smolgen is not None)
         self.mha = MultiHeadAttention(
             in_features=in_features,
-            config=config,
+            d_model=config.d_model,
+            heads=layer_config.heads,
+            kv_heads=layer_config.kv_heads,
+            use_bias_q=config.use_bias_q,
+            use_bias_k=config.use_bias_k,
+            use_bias_v=config.use_bias_v,
+            use_q_scale=config.use_q_scale,
+            smolgen_config=layer_config.smolgen,
             defaults=defaults,
             smol_gen_dense=smol_gen_dense,
             deepnorm_beta=deepnorm_beta,
@@ -86,7 +173,7 @@ class EncoderBlock(nnx.Module):
         self.ln1 = norm_layer(in_features, epsilon=1e-3, rngs=rngs)
         self.ffn = Ffn(
             in_features=in_features,
-            hidden_features=config.dff,
+            hidden_features=layer_config.dff,
             hidden_activation=defaults.ffn_activation,
             deepnorm_beta=deepnorm_beta,
             rngs=rngs,
@@ -118,41 +205,46 @@ class MultiHeadAttention(nnx.Module):
     def __init__(
         self,
         in_features: int,
-        config: model_config_pb2.EncoderConfig,
+        d_model: int,
+        heads: int,
+        kv_heads: int,
+        use_bias_q: bool,
+        use_bias_k: bool,
+        use_bias_v: bool,
+        use_q_scale: bool,
+        smolgen_config: Optional[model_config_pb2.SmolgenConfig],
         defaults: model_config_pb2.DefaultsConfig,
         smol_gen_dense: Optional[nnx.Linear],
         deepnorm_beta: float,
         *,
         rngs: nnx.Rngs,
     ):
-        depth = config.d_model
-        assert depth % config.heads == 0, (
+        depth = d_model
+        assert depth % heads == 0, (
             "Model depth must be divisible by the number of heads."
         )
         self.activation = defaults.activation
         self.depth = depth
-        self.num_heads = config.heads
-        self.kv_heads = (
-            config.kv_heads if config.HasField("kv_heads") else config.heads
-        )
+        self.num_heads = heads
+        self.kv_heads = kv_heads
         assert self.num_heads % self.kv_heads == 0
         head_depth = depth // self.num_heads
 
         self.q = nnx.Linear(
             in_features=in_features,
             out_features=depth,
-            use_bias=config.use_bias_q,
+            use_bias=use_bias_q,
             rngs=rngs,
         )
         self.q_scale = None
-        if config.use_q_scale:
+        if use_q_scale:
             self.q_scale = nnx.Param(
                 jnp.ones((self.num_heads, 1, 1), dtype=jnp.float32)
             )
         self.k = nnx.Linear(
             in_features=in_features,
             out_features=self.kv_heads * head_depth,
-            use_bias=config.use_bias_k,
+            use_bias=use_bias_k,
             rngs=rngs,
         )
         deepnorm_init = flax_initializers.variance_scaling(
@@ -164,7 +256,7 @@ class MultiHeadAttention(nnx.Module):
         self.v = nnx.Linear(
             in_features=in_features,
             out_features=self.kv_heads * head_depth,
-            use_bias=config.use_bias_v,
+            use_bias=use_bias_v,
             kernel_init=deepnorm_init,
             rngs=rngs,
         )
@@ -175,14 +267,14 @@ class MultiHeadAttention(nnx.Module):
             rngs=rngs,
         )
 
-        assert (smol_gen_dense is not None) == config.HasField("smolgen")
+        assert (smol_gen_dense is not None) == (smolgen_config is not None)
         self.smolgen: Optional[Smolgen]
         if smol_gen_dense is not None:
             self.smolgen = Smolgen(
                 in_features=in_features,
-                config=config.smolgen,
+                config=smolgen_config,
                 defaults=defaults,
-                heads=config.heads,
+                heads=heads,
                 weight_gen_dense=smol_gen_dense,
                 rngs=rngs,
             )
