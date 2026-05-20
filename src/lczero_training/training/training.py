@@ -39,6 +39,7 @@ from proto import training_config_pb2 as training_config_pb2
 
 MetricsDict = Dict[str, Any]
 EPS = 1e-12
+STEP_LOG_PERIOD = 25
 
 
 @dataclasses.dataclass(frozen=True)
@@ -200,6 +201,10 @@ def _channel_utilization_index(scales: jax.Array) -> jax.Array:
     probs = magnitudes / jnp.maximum(jnp.sum(magnitudes), EPS)
     entropy = -jnp.sum(probs * jnp.log(jnp.maximum(probs, EPS)))
     return jnp.exp(entropy) / jnp.array(scales.shape[0], dtype=jnp.float32)
+
+
+def _to_host_int(value: Any) -> int:
+    return int(np.asarray(jax.device_get(value)).reshape(()))
 
 
 @dataclasses.dataclass
@@ -424,8 +429,6 @@ class Training:
             loss_landscape_metrics = self._compute_loss_landscape_metrics(
                 weighted_losses
             )
-            policy_metrics = self._compute_policy_metrics(model, batch)
-            ln2_metrics = self._compute_ln2_scale_metrics(model)
             metrics: MetricsDict = {
                 "loss": mean_loss,
                 "unweighted_losses": mean_unweighted,
@@ -433,8 +436,6 @@ class Training:
                 "grad_norm": grad_norm,
                 "optimizer_metrics": optimizer_metrics,
                 "loss_landscape": loss_landscape_metrics,
-                "policy_vanilla": policy_metrics,
-                "ln2_collapse": ln2_metrics,
             }
             return new_jit_state, metrics
 
@@ -520,6 +521,7 @@ class Training:
         ] = None
         if not self._expensive_metrics_disabled and (
             self._advanced_metrics.enable_gradient_conflict_ratio
+            or self._advanced_metrics.enable_policy_entropy_logit_scale
             or self._advanced_metrics.enable_ln2_collapse_diagnostics
         ):
 
@@ -537,6 +539,14 @@ class Training:
                     else None
                 )
                 metrics: Dict[str, jax.Array] = {}
+
+                policy_metrics = self._compute_policy_metrics(model, batch)
+                if policy_metrics:
+                    metrics["policy_vanilla"] = policy_metrics
+
+                ln2_metrics = self._compute_ln2_scale_metrics(model)
+                if ln2_metrics:
+                    metrics["ln2_collapse"] = ln2_metrics
 
                 def loss_for_grad(
                     model_arg: LczeroModel,
@@ -865,7 +875,7 @@ class Training:
     def _validate_and_prepare_batch(
         self, tensor_tuple: tuple[np.ndarray, ...]
     ) -> TrainingBatch:
-        logger.info("Fetched batch from dataloader")
+        logger.debug("Fetched batch from dataloader")
 
         # Convert tuple to TrainingBatch
         batch = TrainingBatch.from_tuple(tensor_tuple)
@@ -900,6 +910,14 @@ class Training:
         num_steps: int,
         metrics: MetricsDict,
     ) -> None:
+        if not logger.isEnabledFor(logging.INFO):
+            return
+        should_log = (
+            (local_step + 1) % STEP_LOG_PERIOD == 0
+            or local_step + 1 == num_steps
+        )
+        if not should_log:
+            return
         loss = float(metrics["loss"])
         unweighted_losses = {
             k: float(v) for k, v in metrics["unweighted_losses"].items()
@@ -944,17 +962,20 @@ class Training:
         memory_profile_dir: Optional[str] = None,
     ) -> JitTrainingState:
         assert jit_state.opt_state is not None
+        start_step_value = _to_host_int(jit_state.step)
         if self._dp_sharding is not None:
             replicated = jshard.NamedSharding(self._dp_sharding.mesh, P())
             jit_state = jax.device_put(jit_state, replicated)
         batch = self._validate_and_prepare_batch(next(datagen))
         for local_step in range(num_steps):
-            logger.info(f"Starting step {jit_state.step}")
+            step_value = start_step_value + local_step + 1
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"Starting step {step_value}")
             if memory_profile_dir is not None:
                 jax.profiler.save_device_memory_profile(
                     f"{memory_profile_dir}/"
                     f"{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-                    f"_before_{int(jit_state.step)}.prof"
+                    f"_before_{step_value - 1}.prof"
                 )
 
             # Compute per-component gradient norms on periodic steps
@@ -980,9 +1001,6 @@ class Training:
             if component_norms is not None:
                 metrics["component_norms"] = component_norms
 
-            step_value = int(
-                np.asarray(jax.device_get(jit_state.step)).reshape(())
-            )
             should_run_expensive = (
                 self._expensive_metrics_fn is not None
                 and self._expensive_metrics_period > 0
@@ -993,7 +1011,7 @@ class Training:
                 expensive_metrics = self._expensive_metrics_fn(
                     jit_state, batch, teacher_model_state
                 )
-                metrics["expensive_metrics"] = expensive_metrics
+                metrics.update(expensive_metrics)
             jit_state = self.maybe_update_swa(
                 jit_state, local_step + 1, num_steps
             )
