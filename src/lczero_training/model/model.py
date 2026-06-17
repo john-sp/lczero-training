@@ -85,7 +85,6 @@ class LczeroModel(nnx.Module):
             rngs=rngs,
         )
 
-        self.policy_embedding_shared: Optional[nnx.Linear] = None
         if self._use_headpremap:
             if (
                 config.headpremap.intermediate_size == 0
@@ -164,6 +163,8 @@ class LczeroModel(nnx.Module):
                     out_features=config.shared_policy_embedding_size,
                     rngs=rngs,
                 )
+            else:
+                self.policy_embedding_shared = None
 
             self.policy_heads = nnx.Dict(
                 {
