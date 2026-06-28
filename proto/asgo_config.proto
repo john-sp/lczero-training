@@ -1,0 +1,280 @@
+syntax = "proto2";
+
+package lczero.training;
+
+import "proto/training_config.proto";
+
+enum AsgoPerturbationMode {
+  ASGO_PERTURBATION_TENSOR_STD = 0;
+  ASGO_PERTURBATION_PER_WEIGHT = 1;
+}
+
+enum AsgoCurvatureMode {
+  ASGO_CURVATURE_ABSOLUTE = 0;
+  ASGO_CURVATURE_PER_ITERATION = 1;
+}
+
+enum AsgoOptimizer {
+  ASGO_OPTIMIZER_ADAM = 0;
+  ASGO_OPTIMIZER_MUON = 1;
+}
+
+enum AsgoLrScheduleType {
+  ASGO_LR_CONSTANT = 0;
+  ASGO_LR_COSINE = 1;
+}
+
+enum AsgoTunedSide {
+  ASGO_TUNED_WHITE = 0;
+  ASGO_TUNED_BLACK = 1;
+}
+
+// Top-level ASGO tuning configuration.
+message AsgoConfig {
+  // Path to the lc0 binary.
+  optional string lc0_path = 1;
+
+  // Which weights to perturb. Reuses WeightsSelector from training_config.
+  optional WeightsSelector perturb_selector = 2;
+
+  // Base perturbation magnitude (c). Default: 0.04.
+  optional float perturbation_size = 3 [default = 0.04];
+
+  // Perturbation scaling mode.
+  optional AsgoPerturbationMode perturbation_mode = 4
+      [default = ASGO_PERTURBATION_TENSOR_STD];
+
+  // Per-tensor c overrides.
+  repeated PerturbationOverride perturbation_overrides = 5;
+
+  // Number of pos/neg pairs per iteration (R). Default: 4.
+  optional int32 rounds_per_iteration = 10 [default = 4];
+
+  // ELO soft-clamp parameter. Default: 60.0.
+  optional float elo_clamp = 11 [default = 60.0];
+
+  // Enable curvature weighting. Default: false.
+  optional bool curvature_weighting = 12 [default = false];
+
+  // Curvature weighting mode.
+  optional AsgoCurvatureMode curvature_mode = 13
+      [default = ASGO_CURVATURE_ABSOLUTE];
+
+  // Noise floor for absolute curvature weighting. Default: 10.0.
+  optional float noise_floor = 14 [default = 10.0];
+
+  // Maximum tuning iterations. 0 means run until interrupted.
+  optional int32 max_iterations = 15 [default = 0];
+
+  // Optimizer to use for ASGO updates. Default: Adam.
+  optional AsgoOptimizer optimizer = 20 [default = ASGO_OPTIMIZER_ADAM];
+
+  // Adam beta1. Default: 0.9.
+  optional float adam_beta1 = 21 [default = 0.9];
+
+  // Adam beta2. Default: 0.95.
+  optional float adam_beta2 = 22 [default = 0.95];
+
+  // Adam epsilon. Default: 1e-8.
+  optional float adam_epsilon = 23 [default = 1e-8];
+
+  // Skip Muon for matrices smaller than this. Default: 32.
+  optional int32 muon_skip_smaller_than = 25 [default = 32];
+
+  // Base learning rate. Default: 0.0005.
+  optional float learning_rate = 26 [default = 0.0005];
+
+  // LR schedule type. Default: constant.
+  optional AsgoLrScheduleType lr_schedule = 30 [default = ASGO_LR_CONSTANT];
+
+  // Final LR after cosine decay. Default: 1e-8.
+  optional float lr_end = 31 [default = 1e-8];
+
+  // Iteration to start cosine decay. Default: 40.
+  optional int32 lr_decay_start = 32 [default = 40];
+
+  // Iteration to end cosine decay. Default: 80.
+  optional int32 lr_decay_end = 33 [default = 80];
+
+  // Number of warmup iterations. Default: 0.
+  optional int32 lr_warmup_iterations = 34 [default = 0];
+
+  // Warmup start factor. Default: 0.0.
+  optional float lr_warmup_start_factor = 35 [default = 0.0];
+
+  // Use quadratic warmup curve. Default: false.
+  optional bool lr_warmup_quadratic = 36 [default = false];
+
+  // Beta1 annealing schedule.
+  optional AnnealingSchedule beta1_schedule = 40;
+
+  // Beta2 annealing schedule.
+  optional AnnealingSchedule beta2_schedule = 41;
+
+  // Enable adaptive masking. Default: false.
+  optional bool adaptive_mask = 50 [default = false];
+
+  // Sensitivity exponent. Default: 1.0.
+  optional float adaptive_mask_exponent = 51 [default = 1.0];
+
+  // Minimum mask value. Default: 0.1.
+  optional float adaptive_mask_floor = 52 [default = 0.1];
+
+  // Tournament configuration.
+  optional AsgoTournamentConfig tournament = 60;
+
+  // Enable AGZO subspace perturbations. Default: false.
+  optional bool activation_guided = 70 [default = false];
+
+  // Iterations between AGZO basis refresh. Default: 5.
+  optional int32 agzo_refresh_interval = 71 [default = 5];
+
+  // Per-tap rank configuration. Tap names should be weight/tap paths, e.g.
+  // "encoders/layers/3/ffn/linear1/kernel".
+  repeated AgzoRank agzo_rank = 72;
+
+  // Coupling specs for multi-layer AGZO.
+  repeated NamedCouplingSpec coupling_spec = 73;
+
+  // Initial iterations to keep the first AGZO basis fixed. Default: 5.
+  optional int32 agzo_phase1_iterations = 74 [default = 5];
+
+  // Directory for ASGO checkpoints.
+  optional string checkpoint_path = 80;
+
+  // Max checkpoints to keep. Default: 5.
+  optional int32 max_checkpoints = 81 [default = 5];
+}
+
+// Per-tensor perturbation magnitude override.
+message PerturbationOverride {
+  // Glob pattern matched against weight path.
+  optional string pattern = 1;
+
+  // Perturbation magnitude for matching weights.
+  optional float c = 2;
+}
+
+// ZO-AdaMU annealing schedule (three-phase: warmup -> transition -> steady).
+message AnnealingSchedule {
+  // Iterations in warmup phase. Default: 2.
+  optional int32 warmup_iters = 1 [default = 2];
+
+  // Iterations in transition phase. Default: 80.
+  optional int32 steady_iters = 2 [default = 80];
+
+  // Value during warmup. Default: 0.0.
+  optional float warmup_value = 3 [default = 0.0];
+
+  // Value after transition. Default: 0.9.
+  optional float steady_value = 4 [default = 0.9];
+}
+
+message AgzoRank {
+  // Tap name, e.g. "encoders/layers/3/ffn/linear1/kernel".
+  optional string tap_name = 1;
+
+  // Rank for this tap.
+  optional int32 rank = 2;
+}
+
+message NamedCouplingSpec {
+  // Stable name used by metrics/checkpoints for this coupling group.
+  optional string name = 1;
+
+  optional CouplingSpec spec = 2;
+}
+
+// Tournament evaluation configuration.
+message AsgoTournamentConfig {
+  // Number of mirrored game pairs per ASGO round. Default: 50.
+  // lc0 receives --games=2*game_pairs_per_round.
+  optional int32 game_pairs_per_round = 1 [default = 50];
+
+  // Nodes per move for lc0. Default: 800.
+  optional int32 nodes = 2 [default = 800];
+
+  // Time per move in ms (alternative to nodes). Default: 0 (disabled).
+  optional int32 movetime = 3 [default = 0];
+
+  // Path to opening book (PGN or PGN.gz).
+  optional string opening_book = 4;
+
+  // Deterministic opening-book seed for lc0 selfplay. -1 means disabled.
+  // Requires an lc0 binary with --opening-seed support.
+  optional int64 opening_seed = 5 [default = -1];
+
+  // GPU ids used for sharded lc0 selfplay. Empty means run one lc0 process
+  // without injecting backend flags.
+  repeated int32 gpu = 6;
+
+  // Extra lc0 arguments (passed verbatim). Repeated for multiple flags.
+  repeated string extra_args = 7;
+
+  // Kill lc0 after this many seconds. Default: 3600.
+  optional int32 timeout_seconds = 8 [default = 3600];
+
+  // lc0 --parallelism value used when gpu is non-empty. Default: 8.
+  optional int32 lc0_parallelism = 9 [default = 8];
+
+  // Evaluation objective. If omitted, normalize_asgo_config fills in
+  // direct_comparison for ordinary ASGO tuning.
+  oneof evaluation {
+    DirectComparisonMode direct_comparison = 10;
+    FixedOpponentMode fixed_opponent = 11;
+  }
+}
+
+// Low-variance mode for ordinary tuning: theta+ and theta- play each other.
+message DirectComparisonMode {
+  // Use lc0 --mirror-openings. Default true.
+  optional bool mirror_openings = 1 [default = true];
+}
+
+// Odds/fixed-opponent mode: candidates are evaluated against configured nets.
+message FixedOpponentMode {
+  // Candidate network's forced board side in the lc0 command.
+  optional AsgoTunedSide tuned_side = 1 [default = ASGO_TUNED_WHITE];
+
+  // Opponents are sampled in proportion to weight.
+  repeated OpponentSpec opponent = 2;
+
+  // Whether to pass --mirror-openings. Default false because odds/opening books
+  // are often side-specific and mirroring can change the training objective.
+  optional bool mirror_openings = 3 [default = false];
+}
+
+message OpponentSpec {
+  // Stable name for metrics and checkpoints.
+  optional string name = 1;
+
+  // Path to the opponent weights (.pb.gz).
+  optional string weights = 2;
+
+  // Sampling weight. Default: 1.0.
+  optional float weight = 3 [default = 1.0];
+
+  // Opponent nodes/visits. 0 means use tournament.nodes.
+  optional int32 nodes = 4 [default = 0];
+
+  // Opponent-specific extra lc0 flags.
+  repeated string extra_args = 5;
+}
+
+// Coupling spec for multi-layer AGZO.
+message CouplingSpec {
+  // Which layers share a subspace.
+  repeated int32 shared_layers = 1;
+
+  // Rank of the shared subspace.
+  optional int32 r_shared = 2;
+
+  // Rank of per-layer unique subspace.
+  optional int32 r_uniq = 3;
+
+  // Whether to use output-space AGZO.
+  optional bool is_output_space = 4 [default = false];
+
+  // Shared/unique budget split. Default: 0.6.
+  optional float beta_shared = 5 [default = 0.6];
+}

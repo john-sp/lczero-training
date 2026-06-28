@@ -7,6 +7,7 @@ import "proto/model_config.proto";
 import "proto/training_config.proto";
 import "proto/metrics_config.proto";
 import "proto/export_config.proto";
+import "proto/asgo_config.proto";
 
 // Root configuration message containing all subsystem configurations.
 message RootConfig {
@@ -24,4 +25,6 @@ message RootConfig {
   optional MetricsConfig metrics = 6;
   // Export configuration
   optional ExportConfig export = 7;
+  // ASGO tuning configuration
+  optional AsgoConfig asgo = 8;
 }

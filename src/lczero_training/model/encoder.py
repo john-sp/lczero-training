@@ -1,4 +1,5 @@
 import math
+from collections.abc import Callable
 from typing import Optional
 
 import jax
@@ -10,6 +11,8 @@ from proto import model_config_pb2
 
 from .shared import Ffn
 from .utils import get_activation, get_norm_layer
+
+ActivationSink = Callable[[str, jax.Array], None]
 
 
 _SEQUENTIAL_BLOCK_STYLE = (
@@ -118,6 +121,7 @@ class EncoderTower(nnx.Module):
                 rngs=rngs,
             )
 
+        self.layer_configs = layer_configs
         self.encoders = nnx.Sequential(
             *[
                 EncoderBlock(
@@ -133,8 +137,20 @@ class EncoderTower(nnx.Module):
             ]
         )
 
-    def __call__(self, x: jax.Array) -> jax.Array:
-        return self.encoders(x)
+    def __call__(
+        self,
+        x: jax.Array,
+        activation_sink: ActivationSink | None = None,
+    ) -> jax.Array:
+        if activation_sink is None:
+            return self.encoders(x)
+        for layer_idx, encoder in enumerate(self.encoders.layers):
+            x = encoder(
+                x,
+                layer_index=layer_idx,
+                activation_sink=activation_sink,
+            )
+        return x
 
 
 class EncoderBlock(nnx.Module):
@@ -186,16 +202,33 @@ class EncoderBlock(nnx.Module):
         ):
             raise ValueError(f"Unsupported block style: {self.block_style}")
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        x: jax.Array,
+        layer_index: int | None = None,
+        activation_sink: ActivationSink | None = None,
+    ) -> jax.Array:
         if self.block_style == _SEQUENTIAL_BLOCK_STYLE:
-            x = x + self.mha(x) * self.alpha
+            x = x + self.mha(
+                x, layer_index=layer_index, activation_sink=activation_sink
+            ) * self.alpha
             out1 = self.ln1(x)
-            ffn_out = self.ffn(out1)
+            ffn_out = self.ffn(
+                out1,
+                layer_index=layer_index,
+                activation_sink=activation_sink,
+            )
             return self.ln2(out1 + ffn_out * self.alpha)
 
         normed = self.ln1(x)
-        attn_out = self.mha(normed)
-        ffn_out = self.ffn(normed)
+        attn_out = self.mha(
+            normed, layer_index=layer_index, activation_sink=activation_sink
+        )
+        ffn_out = self.ffn(
+            normed,
+            layer_index=layer_index,
+            activation_sink=activation_sink,
+        )
         return self.ln2(x + (attn_out + ffn_out) * self.alpha)
 
 
@@ -281,7 +314,17 @@ class MultiHeadAttention(nnx.Module):
         else:
             self.smolgen = None
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        x: jax.Array,
+        layer_index: int | None = None,
+        activation_sink: ActivationSink | None = None,
+    ) -> jax.Array:
+        if activation_sink is not None and layer_index is not None:
+            prefix = f"encoders/layers/{layer_index}/mha"
+            activation_sink(f"{prefix}/q/kernel", x)
+            activation_sink(f"{prefix}/k/kernel", x)
+            activation_sink(f"{prefix}/v/kernel", x)
         q, k, v = self.q(x), self.k(x), self.v(x)
 
         head_depth = self.depth // self.num_heads
@@ -303,7 +346,9 @@ class MultiHeadAttention(nnx.Module):
         logits /= jnp.sqrt(k.shape[-1]).astype(k.dtype)
 
         if self.smolgen is not None:
-            logits += self.smolgen(x)
+            logits += self.smolgen(
+                x, layer_index=layer_index, activation_sink=activation_sink
+            )
 
         attention_weights = nnx.softmax(logits, axis=-1)
         scaled_attention = jnp.matmul(attention_weights, v)
@@ -312,6 +357,11 @@ class MultiHeadAttention(nnx.Module):
         scaled_attention = scaled_attention.transpose((1, 0, 2)).reshape(
             (-1, self.depth)
         )
+        if activation_sink is not None and layer_index is not None:
+            activation_sink(
+                f"encoders/layers/{layer_index}/mha/output_dense/kernel",
+                scaled_attention,
+            )
         return self.output_dense(scaled_attention)
 
 
@@ -355,12 +405,27 @@ class Smolgen(nnx.Module):
         self.weight_gen_dense = weight_gen_dense
         self.activation = config.activation or defaults.activation
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        x: jax.Array,
+        layer_index: int | None = None,
+        activation_sink: ActivationSink | None = None,
+    ) -> jax.Array:
         compressed = self.compress(x).flatten()
+        if activation_sink is not None and layer_index is not None:
+            activation_sink(
+                f"encoders/layers/{layer_index}/mha/smolgen/dense1/kernel",
+                compressed,
+            )
         hidden = self.dense1(compressed)
         hidden = get_activation(self.activation)(hidden)
         hidden = self.ln1(hidden)
 
+        if activation_sink is not None and layer_index is not None:
+            activation_sink(
+                f"encoders/layers/{layer_index}/mha/smolgen/dense2/kernel",
+                hidden,
+            )
         gen_from = self.dense2(hidden)
         gen_from = get_activation(self.activation)(gen_from)
         gen_from = self.ln2(gen_from)

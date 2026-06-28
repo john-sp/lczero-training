@@ -1,5 +1,6 @@
 import dataclasses
 import math
+from collections.abc import Callable
 from typing import Optional, Tuple
 
 import jax
@@ -16,6 +17,8 @@ from .policy_head import PolicyHead
 from .simple_head import SimpleMovesLeftHead, SimplePolicyHead, SimpleValueHead
 from .utils import get_dtype
 from .value_head import ValueHead
+
+ActivationSink = Callable[[str, jax.Array], None]
 
 
 @jax.tree_util.register_dataclass
@@ -190,12 +193,16 @@ class LczeroModel(nnx.Module):
                 }
             )
 
-    def __call__(self, x: jax.Array) -> ModelPrediction:
+    def __call__(
+        self,
+        x: jax.Array,
+        activation_sink: ActivationSink | None = None,
+    ) -> ModelPrediction:
         x = jnp.astype(x, get_dtype(self.config.defaults.compute_dtype))
         x = jnp.transpose(x, (1, 2, 0))
         x = jnp.reshape(x, (64, self._input_channels))
         x = self.embedding(x)
-        x = self.encoders(x)
+        x = self.encoders(x, activation_sink=activation_sink)
 
         if self._use_headpremap:
             assert self.headpremap is not None
