@@ -5,7 +5,7 @@ from typing import Iterable
 from google.protobuf.message import Message
 
 _ASGO_LR_COSINE = 1
-ASGO_DEFAULT_ACTIVATION_CACHE_BATCHES = 200
+ASGO_DEFAULT_ACTIVATION_CACHE_BATCHES = 20
 _RUNNER_OWNED_LC0_FLAGS = frozenset(
     {
         "--backend",

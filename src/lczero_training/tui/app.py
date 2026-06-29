@@ -61,6 +61,9 @@ class TrainingTuiApp(App):
     """
 
     CSS_PATH = "app.tcss"
+    DAEMON_MODULE = "lczero_training.commands.daemon"
+    DATA_PIPELINE_TITLE = "Training data pipeline"
+    TRAINING_SCHEDULE_TITLE = "Training Schedule"
 
     @staticmethod
     def add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -130,7 +133,7 @@ class TrainingTuiApp(App):
             [
                 sys.executable,
                 "-m",
-                "lczero_training.commands.daemon",
+                self.DAEMON_MODULE,
                 *self._daemon_flags,
             ],
             stdin=subprocess.PIPE,
@@ -162,13 +165,15 @@ class TrainingTuiApp(App):
         yield HeaderBar()
 
         self._data_pipeline_pane = DataPipelinePane()
-        self._data_pipeline_pane.border_title = "Training data pipeline"
+        self._data_pipeline_pane.border_title = self.DATA_PIPELINE_TITLE
         yield self._data_pipeline_pane
 
         # Horizontal split below the data pipeline pane
         with Horizontal(id="training-status-container"):
             self._training_schedule_widget = TrainingScheduleWidget()
-            self._training_schedule_widget.border_title = "Training Schedule"
+            self._training_schedule_widget.border_title = (
+                self.TRAINING_SCHEDULE_TITLE
+            )
             yield self._training_schedule_widget
 
             jax_training_pane = JAXTrainingPane()

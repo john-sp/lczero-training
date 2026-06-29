@@ -8,7 +8,7 @@ import signal
 import time
 from collections.abc import Sequence
 from concurrent import futures
-from typing import Protocol
+from typing import Callable, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -47,7 +47,7 @@ from lczero_training.convert.leela_to_jax import (
     LeelaImportOptions,
     leela_to_jax,
 )
-from lczero_training.dataloader import make_dataloader
+from lczero_training.dataloader import DataLoader, make_dataloader
 from lczero_training.model.model import LczeroModel
 from lczero_training.training.tensorboard import TensorboardLogger
 from proto import hlo_pb2, net_pb2
@@ -77,7 +77,13 @@ class RoundPreparation:
 class AsgoTuner:
     """Main single-machine ASGO tuning loop."""
 
-    def __init__(self, config: RootConfig) -> None:
+    def __init__(
+        self,
+        config: RootConfig,
+        *,
+        data_loader_callback: Callable[[DataLoader | None], None] | None = None,
+    ) -> None:
+        self._data_loader_callback = data_loader_callback
         if not config.HasField("asgo"):
             raise AsgoConfigError("Config must contain an 'asgo' section.")
         self.config = RootConfig()
@@ -342,16 +348,25 @@ class AsgoTuner:
         logger.info(
             "Dataloader created.",
         )
-        batches = populate_activation_cache(
-            dataloader,
-            n_batches=ASGO_DEFAULT_ACTIVATION_CACHE_BATCHES,
-        )
+        self._set_active_data_loader(dataloader)
+        try:
+            batches = populate_activation_cache(
+                dataloader,
+                n_batches=ASGO_DEFAULT_ACTIVATION_CACHE_BATCHES,
+            )
+        finally:
+            self._set_active_data_loader(None)
+            dataloader.stop()
         logger.info(
             "ASGO activation cache contains %d batches and %d positions.",
             len(batches),
             activation_cache_position_count(batches),
         )
         return batches
+
+    def _set_active_data_loader(self, loader: DataLoader | None) -> None:
+        if self._data_loader_callback is not None:
+            self._data_loader_callback(loader)
 
     def _maybe_refresh_agzo(self) -> None:
         if not self.asgo.activation_guided:
