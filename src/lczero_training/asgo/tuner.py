@@ -339,6 +339,9 @@ class AsgoTuner:
             ASGO_DEFAULT_ACTIVATION_CACHE_BATCHES,
         )
         dataloader = make_dataloader(self.config.data_loader)
+        logger.info(
+            "Dataloader created.",
+        )
         batches = populate_activation_cache(
             dataloader,
             n_batches=ASGO_DEFAULT_ACTIVATION_CACHE_BATCHES,

@@ -1,4 +1,5 @@
 from collections.abc import Iterable, Iterator, Mapping
+import logging
 from typing import Protocol, cast
 
 import jax
@@ -11,6 +12,8 @@ from lczero_training.asgo.subspace import (
     activation_matrix,
 )
 from lczero_training.model.model import LczeroModel
+
+logger = logging.getLogger(__name__)
 
 
 class _DataLoaderLike(Protocol):
@@ -103,6 +106,7 @@ def populate_activation_cache(
         raise ValueError("n_batches must be positive.")
     batches = []
     for idx, batch in enumerate(_iter_dataloader_batches(dataloader)):
+        logger.info("Populating activation cache: batch %d/%d", idx + 1, n_batches)
         if idx >= n_batches:
             break
         if len(batch) != 3:
@@ -114,6 +118,7 @@ def populate_activation_cache(
 def _iter_dataloader_batches(
     dataloader: Iterable[tuple[jax.Array, ...]] | _DataLoaderLike,
 ) -> Iterator[tuple[jax.Array, ...]]:
+    logger.info("Iterating over dataloader batches.")
     if hasattr(dataloader, "get_next"):
         loader = cast(_DataLoaderLike, dataloader)
         while True:
