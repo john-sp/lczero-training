@@ -1,4 +1,5 @@
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from typing import Protocol, cast
 
 import jax
 import jax.numpy as jnp
@@ -10,6 +11,10 @@ from lczero_training.asgo.subspace import (
     activation_matrix,
 )
 from lczero_training.model.model import LczeroModel
+
+
+class _DataLoaderLike(Protocol):
+    def get_next(self) -> tuple[jax.Array, ...]: ...
 
 
 class ActivationAccumulator:
@@ -90,20 +95,31 @@ def collect_activation_bases(
 
 
 def populate_activation_cache(
-    dataloader: Iterable[tuple[jax.Array, ...]],
+    dataloader: Iterable[tuple[jax.Array, ...]] | _DataLoaderLike,
     n_batches: int = ASGO_DEFAULT_ACTIVATION_CACHE_BATCHES,
 ) -> list[jax.Array]:
     """Extracts model input tensors from dataloader batches."""
     if n_batches <= 0:
         raise ValueError("n_batches must be positive.")
     batches = []
-    for idx, batch in enumerate(dataloader):
+    for idx, batch in enumerate(_iter_dataloader_batches(dataloader)):
         if idx >= n_batches:
             break
         if len(batch) != 3:
             raise ValueError(f"Expected tuple of 3 tensors, got {len(batch)}.")
         batches.append(jnp.asarray(batch[0]))
     return batches
+
+
+def _iter_dataloader_batches(
+    dataloader: Iterable[tuple[jax.Array, ...]] | _DataLoaderLike,
+) -> Iterator[tuple[jax.Array, ...]]:
+    if hasattr(dataloader, "get_next"):
+        loader = cast(_DataLoaderLike, dataloader)
+        while True:
+            yield loader.get_next()
+    else:
+        yield from cast(Iterable[tuple[jax.Array, ...]], dataloader)
 
 
 def should_refresh_agzo(iteration: int, config: object) -> bool:
