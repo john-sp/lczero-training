@@ -1,3 +1,4 @@
+import dataclasses
 import datetime
 import glob
 import gzip
@@ -6,6 +7,7 @@ import os
 import signal
 import time
 from collections.abc import Sequence
+from concurrent import futures
 from typing import Protocol
 
 import jax
@@ -59,6 +61,17 @@ class TournamentMetricResult(Protocol):
     draws: int
     losses: int
     npm: float
+
+
+@dataclasses.dataclass(frozen=True)
+class RoundPreparation:
+    """Files and delta prepared for one ASGO round."""
+
+    round_idx: int
+    subkey: jax.Array
+    delta: nnx.State
+    pos_path: str
+    neg_path: str
 
 
 class AsgoTuner:
@@ -177,57 +190,64 @@ class AsgoTuner:
                 self.asgo.adaptive_mask_floor,
             )
 
-        for round_idx in range(self.asgo.rounds_per_iteration):
-            logger.info(
-                "ASGO iteration %d round %d/%d",
-                self.iteration,
-                round_idx + 1,
-                self.asgo.rounds_per_iteration,
-            )
+        round_keys = []
+        for _round_idx in range(self.asgo.rounds_per_iteration):
             self.rng, subkey = jax.random.split(self.rng)
-            delta = self.perturbation_mgr.generate(
-                iteration=self.iteration,
-                rng=subkey,
-                momentum=self.m,
-                adaptive_masks=adaptive_masks,
-            )
-            deltas.append(delta)
+            round_keys.append(subkey)
 
-            params_plus = jax.tree.map(
-                lambda param, diff: param + diff, self.model_params, delta
+        with futures.ThreadPoolExecutor(max_workers=1) as export_pool:
+            prepare_future = export_pool.submit(
+                self._prepare_round,
+                0,
+                round_keys[0],
+                adaptive_masks,
             )
-            params_minus = jax.tree.map(
-                lambda param, diff: param - diff, self.model_params, delta
-            )
-            pos_path = self._export_variant(
-                params_plus, self.iteration, round_idx, "pos"
-            )
-            neg_path = self._export_variant(
-                params_minus, self.iteration, round_idx, "neg"
-            )
+            for round_idx in range(self.asgo.rounds_per_iteration):
+                logger.info(
+                    "ASGO iteration %d round %d/%d",
+                    self.iteration,
+                    round_idx + 1,
+                    self.asgo.rounds_per_iteration,
+                )
 
-            eval_start = time.time()
-            if self.asgo.tournament.HasField("fixed_opponent"):
-                result = self.tournament.evaluate_against_opponents(
-                    pos_weights_path=pos_path,
-                    neg_weights_path=neg_path,
-                    rng=subkey,
+                prepared = prepare_future.result()
+                if prepared.round_idx != round_idx:
+                    raise RuntimeError(
+                        "ASGO round preparation completed out of order."
+                    )
+                deltas.append(prepared.delta)
+
+                next_round_idx = round_idx + 1
+                if next_round_idx < self.asgo.rounds_per_iteration:
+                    prepare_future = export_pool.submit(
+                        self._prepare_round,
+                        next_round_idx,
+                        round_keys[next_round_idx],
+                        adaptive_masks,
+                    )
+
+                eval_start = time.time()
+                if self.asgo.tournament.HasField("fixed_opponent"):
+                    result = self.tournament.evaluate_against_opponents(
+                        pos_weights_path=prepared.pos_path,
+                        neg_weights_path=prepared.neg_path,
+                        rng=prepared.subkey,
+                    )
+                else:
+                    result = self.tournament.evaluate_pair(
+                        pos_weights_path=prepared.pos_path,
+                        neg_weights_path=prepared.neg_path,
+                    )
+                tournament_time += time.time() - eval_start
+                elo_diffs.append(result.elo_diff)
+                tournament_results.append(result)
+                logger.info(
+                    "ASGO round result: elo=%+.1f WDL=%d/%d/%d",
+                    result.elo_diff,
+                    result.wins,
+                    result.draws,
+                    result.losses,
                 )
-            else:
-                result = self.tournament.evaluate_pair(
-                    pos_weights_path=pos_path,
-                    neg_weights_path=neg_path,
-                )
-            tournament_time += time.time() - eval_start
-            elo_diffs.append(result.elo_diff)
-            tournament_results.append(result)
-            logger.info(
-                "ASGO round result: elo=%+.1f WDL=%d/%d/%d",
-                result.elo_diff,
-                result.wins,
-                result.draws,
-                result.losses,
-            )
 
         gradient = compute_gradient(
             deltas=deltas,
@@ -365,6 +385,39 @@ class AsgoTuner:
         )
         self._write_network(params, path, training_steps=iteration)
         return path
+
+    def _prepare_round(
+        self,
+        round_idx: int,
+        subkey: jax.Array,
+        adaptive_masks: dict[str, jax.Array] | None,
+    ) -> RoundPreparation:
+        delta = self.perturbation_mgr.generate(
+            iteration=self.iteration,
+            rng=subkey,
+            momentum=self.m,
+            adaptive_masks=adaptive_masks,
+        )
+
+        params_plus = jax.tree.map(
+            lambda param, diff: param + diff, self.model_params, delta
+        )
+        params_minus = jax.tree.map(
+            lambda param, diff: param - diff, self.model_params, delta
+        )
+        pos_path = self._export_variant(
+            params_plus, self.iteration, round_idx, "pos"
+        )
+        neg_path = self._export_variant(
+            params_minus, self.iteration, round_idx, "neg"
+        )
+        return RoundPreparation(
+            round_idx=round_idx,
+            subkey=subkey,
+            delta=delta,
+            pos_path=pos_path,
+            neg_path=neg_path,
+        )
 
     def _export_current(self, iteration: int) -> None:
         if not self.config.export.destination_filename:
