@@ -32,6 +32,20 @@ class AsgoState:
     config_hash: str
 
 
+@struct.dataclass
+class _AsgoStateWithoutActivationBases:
+    """ASGO state restore template for checkpoints with dynamic AGZO bases."""
+
+    iteration: int
+    model_params: nnx.State
+    m: nnx.State
+    v: nnx.State
+    beta1_product: jax.Array
+    beta2_product: jax.Array
+    rng: jax.Array
+    config_hash: str
+
+
 class AsgoCheckpointManager:
     """Small wrapper around Orbax for ASGO checkpoints."""
 
@@ -65,13 +79,49 @@ class AsgoCheckpointManager:
         self._manager.save(step=step, args=ocp.args.PyTreeSave(state))
         self._manager.wait_until_finished()
 
-    def restore_latest(self, empty_state: AsgoState) -> Optional[AsgoState]:
+    def restore_latest(
+        self,
+        empty_state: AsgoState,
+        *,
+        partial_restore: bool = False,
+        restore_activation_bases: bool = True,
+    ) -> Optional[AsgoState]:
         step = self.latest_step()
         if step is None:
             return None
+        restore_item: AsgoState | _AsgoStateWithoutActivationBases
+        restore_item = empty_state
+        if not restore_activation_bases:
+            restore_item = _AsgoStateWithoutActivationBases(
+                iteration=empty_state.iteration,
+                model_params=empty_state.model_params,
+                m=empty_state.m,
+                v=empty_state.v,
+                beta1_product=empty_state.beta1_product,
+                beta2_product=empty_state.beta2_product,
+                rng=empty_state.rng,
+                config_hash=empty_state.config_hash,
+            )
+            partial_restore = True
+
+        restore_kwargs: dict[str, object] = {"item": restore_item}
+        if partial_restore:
+            restore_kwargs["partial_restore"] = True
         restored = self._manager.restore(
-            step, args=ocp.args.PyTreeRestore(empty_state)
+            step, args=ocp.args.PyTreeRestore(**restore_kwargs)
         )
+        if isinstance(restored, _AsgoStateWithoutActivationBases):
+            return AsgoState(
+                iteration=restored.iteration,
+                model_params=restored.model_params,
+                m=restored.m,
+                v=restored.v,
+                beta1_product=restored.beta1_product,
+                beta2_product=restored.beta2_product,
+                rng=restored.rng,
+                activation_bases={},
+                config_hash=restored.config_hash,
+            )
         assert restored is None or isinstance(restored, AsgoState)
         return restored
 

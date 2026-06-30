@@ -24,6 +24,14 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override config max_iterations.",
     )
+    parser.add_argument(
+        "--override-lc0-config-conflict",
+        action="store_true",
+        help=(
+            "Allow runner-owned lc0 flags and resume from a checkpoint whose "
+            "ASGO config hash differs."
+        ),
+    )
     return parser
 
 
@@ -45,7 +53,10 @@ def main(argv: list[str] | None = None) -> int:
         logging.error("Config must contain an 'asgo' section.")
         return 1
 
-    tuner = AsgoTuner(config)
+    tuner = AsgoTuner(
+        config,
+        override_lc0_config_conflict=args.override_lc0_config_conflict,
+    )
     tuner.run(max_iterations=args.max_iterations)
     return 0
 

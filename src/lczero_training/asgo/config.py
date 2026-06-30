@@ -66,7 +66,10 @@ def normalize_asgo_config(config: Message) -> Message:
 
 
 def validate_asgo_config(
-    config: Message, *, validate_paths: bool = True
+    config: Message,
+    *,
+    validate_paths: bool = True,
+    override_lc0_config_conflict: bool = False,
 ) -> None:
     """Raises AsgoConfigError if an ASGO config is invalid.
 
@@ -136,7 +139,12 @@ def validate_asgo_config(
     if not _has_field(config, "tournament"):
         errors.append("asgo.tournament must be set.")
     else:
-        _validate_tournament(errors, config.tournament, validate_paths)
+        _validate_tournament(
+            errors,
+            config.tournament,
+            validate_paths,
+            override_lc0_config_conflict,
+        )
 
     if config.activation_guided:
         if config.agzo_refresh_interval < 0:
@@ -196,7 +204,10 @@ def _check_unit_interval(errors: list[str], name: str, value: float) -> None:
 
 
 def _validate_tournament(
-    errors: list[str], tournament: Message, validate_paths: bool
+    errors: list[str],
+    tournament: Message,
+    validate_paths: bool,
+    override_lc0_config_conflict: bool,
 ) -> None:
     _check_positive(
         errors,
@@ -233,7 +244,10 @@ def _validate_tournament(
         errors, "asgo.tournament.timeout_seconds", tournament.timeout_seconds
     )
     _validate_extra_args(
-        errors, "asgo.tournament.extra_args", tournament.extra_args
+        errors,
+        "asgo.tournament.extra_args",
+        tournament.extra_args,
+        override_lc0_config_conflict,
     )
 
     evaluation = tournament.WhichOneof("evaluation")
@@ -243,12 +257,18 @@ def _validate_tournament(
         )
     elif evaluation == "fixed_opponent":
         _validate_fixed_opponent(
-            errors, tournament.fixed_opponent, validate_paths
+            errors,
+            tournament.fixed_opponent,
+            validate_paths,
+            override_lc0_config_conflict,
         )
 
 
 def _validate_fixed_opponent(
-    errors: list[str], fixed_opponent: Message, validate_paths: bool
+    errors: list[str],
+    fixed_opponent: Message,
+    validate_paths: bool,
+    override_lc0_config_conflict: bool,
 ) -> None:
     if not fixed_opponent.opponent:
         errors.append(
@@ -270,16 +290,22 @@ def _validate_fixed_opponent(
         if opponent.nodes < 0:
             errors.append(f"Opponent {label} nodes must be non-negative.")
         _validate_extra_args(
-            errors, f"Opponent {label} extra_args", opponent.extra_args
+            errors,
+            f"Opponent {label} extra_args",
+            opponent.extra_args,
+            override_lc0_config_conflict,
         )
 
 
 def _validate_extra_args(
-    errors: list[str], label: str, extra_args: Iterable[str]
+    errors: list[str],
+    label: str,
+    extra_args: Iterable[str],
+    override_lc0_config_conflict: bool,
 ) -> None:
     for arg in extra_args:
         flag = arg.split("=", 1)[0]
-        if flag in _RUNNER_OWNED_LC0_FLAGS:
+        if flag in _RUNNER_OWNED_LC0_FLAGS and not override_lc0_config_conflict:
             errors.append(f"{label} must not contain runner-owned flag {flag}.")
 
 

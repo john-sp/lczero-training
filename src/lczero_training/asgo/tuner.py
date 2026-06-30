@@ -82,15 +82,20 @@ class AsgoTuner:
         config: RootConfig,
         *,
         data_loader_callback: Callable[[DataLoader | None], None] | None = None,
+        override_lc0_config_conflict: bool = False,
     ) -> None:
         self._data_loader_callback = data_loader_callback
+        self._override_lc0_config_conflict = override_lc0_config_conflict
         if not config.HasField("asgo"):
             raise AsgoConfigError("Config must contain an 'asgo' section.")
         self.config = RootConfig()
         self.config.CopyFrom(config)
         self.asgo = normalize_asgo_config(self.config.asgo)
         self.config.asgo.CopyFrom(self.asgo)
-        validate_asgo_config(self.asgo)
+        validate_asgo_config(
+            self.asgo,
+            override_lc0_config_conflict=override_lc0_config_conflict,
+        )
         if self.asgo.activation_guided and not self.config.HasField(
             "data_loader"
         ):
@@ -114,6 +119,9 @@ class AsgoTuner:
         compact_empty_state = self._empty_state(
             empty_model_params, compact_optimizer_state=True
         )
+        full_empty_state = self._empty_state(
+            empty_model_params, compact_optimizer_state=False
+        )
         try:
             initial_state = self.checkpoint_mgr.restore_latest(
                 compact_empty_state
@@ -124,21 +132,76 @@ class AsgoTuner:
                 "legacy full-size optimizer state template: %s",
                 err,
             )
-            initial_state = self.checkpoint_mgr.restore_latest(
-                self._empty_state(
-                    empty_model_params, compact_optimizer_state=False
+            try:
+                initial_state = self.checkpoint_mgr.restore_latest(
+                    full_empty_state
                 )
-            )
+            except Exception as legacy_err:
+                logger.warning(
+                    "Exact ASGO checkpoint restore failed; retrying with "
+                    "partial restore for checkpoint-only fields such as "
+                    "activation_bases: %s",
+                    legacy_err,
+                )
+                try:
+                    initial_state = self.checkpoint_mgr.restore_latest(
+                        compact_empty_state,
+                        partial_restore=True,
+                    )
+                except Exception as partial_err:
+                    logger.warning(
+                        "Compact partial ASGO checkpoint restore failed; "
+                        "retrying without checkpointed activation bases. "
+                        "Activation bases will be refreshed if AGZO is "
+                        "enabled: %s",
+                        partial_err,
+                    )
+                    try:
+                        initial_state = self.checkpoint_mgr.restore_latest(
+                            compact_empty_state,
+                            restore_activation_bases=False,
+                        )
+                    except Exception as compact_without_bases_err:
+                        logger.warning(
+                            "Compact restore without activation bases failed; "
+                            "retrying with legacy full-size optimizer state "
+                            "template and partial restore: %s",
+                            compact_without_bases_err,
+                        )
+                        try:
+                            initial_state = self.checkpoint_mgr.restore_latest(
+                                full_empty_state,
+                                partial_restore=True,
+                            )
+                        except Exception as full_partial_err:
+                            logger.warning(
+                                "Full-size partial ASGO checkpoint restore "
+                                "failed; retrying without checkpointed "
+                                "activation bases. Activation bases will be "
+                                "refreshed if AGZO is enabled: %s",
+                                full_partial_err,
+                            )
+                            initial_state = (
+                                self.checkpoint_mgr.restore_latest(
+                                    full_empty_state,
+                                    restore_activation_bases=False,
+                                )
+                            )
         if initial_state is None:
             raise FileNotFoundError(
                 f"No ASGO checkpoint found in {self.asgo.checkpoint_path}."
             )
         expected_hash = hash_config(self.asgo)
         if initial_state.config_hash != expected_hash:
-            raise AsgoConfigError(
-                "ASGO config hash does not match the latest checkpoint. "
-                "Restore the original ASGO config or run an explicit "
-                "checkpoint migration before resuming."
+            if not self._override_lc0_config_conflict:
+                raise AsgoConfigError(
+                    "ASGO config hash does not match the latest checkpoint. "
+                    "Restore the original ASGO config or run an explicit "
+                    "checkpoint migration before resuming."
+                )
+            logger.warning(
+                "ASGO config hash does not match the latest checkpoint; "
+                "continuing because lc0 config conflict override is set."
             )
 
         self.model_params = initial_state.model_params
@@ -170,6 +233,8 @@ class AsgoTuner:
         )
         self._last_agzo_refresh_time_s = 0.0
         self._last_agzo_basis_orthonormality_error = 0.0
+        if self.asgo.activation_guided and not initial_state.activation_bases:
+            self._maybe_refresh_agzo(force=True)
         self._shutdown_requested = False
         signal.signal(signal.SIGINT, self._handle_shutdown)
 
@@ -397,10 +462,10 @@ class AsgoTuner:
         if self._data_loader_callback is not None:
             self._data_loader_callback(loader)
 
-    def _maybe_refresh_agzo(self) -> None:
+    def _maybe_refresh_agzo(self, *, force: bool = False) -> None:
         if not self.asgo.activation_guided:
             return
-        if not should_refresh_agzo(self.iteration, self.asgo):
+        if not force and not should_refresh_agzo(self.iteration, self.asgo):
             return
         ranks_by_tap = {
             rank.tap_name: rank.rank for rank in self.asgo.agzo_rank
