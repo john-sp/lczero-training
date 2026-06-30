@@ -77,6 +77,24 @@ class ActivationSketch:
         self._covariance = self._covariance + h_matrix @ h_matrix.T
         self._samples += h_matrix.shape[1]
 
+    def update_covariance(
+        self,
+        covariance: jax.Array,
+        samples: int,
+    ) -> None:
+        """Consumes a precomputed covariance contribution."""
+        if covariance.shape != self._covariance.shape:
+            raise ValueError(
+                f"Expected covariance shape {self._covariance.shape}, "
+                f"got {covariance.shape}."
+            )
+        if samples <= 0:
+            raise ValueError("samples must be positive.")
+        self._covariance = self._covariance + covariance.astype(
+            self.accumulator_dtype
+        )
+        self._samples += samples
+
     def basis(self) -> jax.Array:
         """Returns a float32 orthonormal basis with shape (d_in, rank)."""
         if self._samples == 0:

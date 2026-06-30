@@ -12,6 +12,7 @@ from lczero_training.asgo.subspace import (
     activation_matrix,
 )
 from lczero_training.model.model import LczeroModel
+from lczero_training.model.utils import get_dtype
 
 logger = logging.getLogger(__name__)
 
@@ -92,8 +93,12 @@ def collect_activation_bases(
             d_in=_expected_d_in(model, tap_name),
             rank=rank,
         )
-    sink = ActivationSketchSink(sketches)
-    _run_model_over_cached_inputs(model, model_params, batches, sink)
+    _update_activation_sketches_over_cached_inputs(
+        model,
+        model_params,
+        batches,
+        sketches,
+    )
     return {tap_name: sketch.basis() for tap_name, sketch in sketches.items()}
 
 
@@ -170,6 +175,81 @@ def _run_model_over_cached_inputs(
                 "Activation cache inputs must have shape "
                 "[112, 8, 8] or [batch, 112, 8, 8]."
             )
+
+
+def _update_activation_sketches_over_cached_inputs(
+    model: LczeroModel,
+    model_params: nnx.State,
+    batches: list[jax.Array],
+    sketches: Mapping[str, ActivationSketch],
+) -> None:
+    graphdef, _ = nnx.split(model)
+    restored_model = nnx.merge(graphdef, model_params)
+    tap_names = tuple(sketches.keys())
+
+    @jax.jit
+    def batch_covariances(
+        inputs: jax.Array,
+    ) -> tuple[tuple[jax.Array, ...], tuple[jax.Array, ...]]:
+        activations_by_tap = jax.vmap(
+            lambda sample: _encoder_tap_activations(
+                restored_model,
+                sample,
+                tap_names,
+            )
+        )(inputs)
+        covariances = []
+        sample_counts = []
+        for activations in activations_by_tap:
+            h_matrix = activation_matrix(activations).astype(jnp.float32)
+            covariances.append(h_matrix @ h_matrix.T)
+            sample_counts.append(
+                jnp.asarray(h_matrix.shape[1], dtype=jnp.int32)
+            )
+        return tuple(covariances), tuple(sample_counts)
+
+    for batch in batches:
+        inputs = jnp.asarray(batch)
+        if inputs.ndim == 3:
+            inputs = inputs[None, ...]
+        elif inputs.ndim != 4:
+            raise ValueError(
+                "Activation cache inputs must have shape "
+                "[112, 8, 8] or [batch, 112, 8, 8]."
+            )
+
+        covariances, sample_counts = batch_covariances(inputs)
+        for tap_name, covariance, sample_count in zip(
+            tap_names,
+            covariances,
+            sample_counts,
+            strict=True,
+        ):
+            sketches[tap_name].update_covariance(
+                covariance,
+                int(sample_count),
+            )
+
+
+def _encoder_tap_activations(
+    model: LczeroModel,
+    sample: jax.Array,
+    tap_names: tuple[str, ...],
+) -> tuple[jax.Array, ...]:
+    tap_set = frozenset(tap_names)
+    activations = {}
+
+    def sink(tap_name: str, activation: jax.Array) -> None:
+        canonical_name = _canonical_tap_name(tap_name)
+        if canonical_name in tap_set:
+            activations[canonical_name] = activation
+
+    x = jnp.astype(sample, get_dtype(model.config.defaults.compute_dtype))
+    x = jnp.transpose(x, (1, 2, 0))
+    x = jnp.reshape(x, (64, model._input_channels))
+    x = model.embedding(x)
+    model.encoders(x, activation_sink=sink)
+    return tuple(activations[tap_name] for tap_name in tap_names)
 
 
 def _expected_d_in(model: LczeroModel, tap_name: str) -> int:
