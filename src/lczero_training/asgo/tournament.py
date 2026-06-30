@@ -152,6 +152,7 @@ class TournamentRunner:
                 ]
             )
             opponent_side = "white"
+            candidate_side = "black"
             perspective = ResultPerspective.BLACK
         else:
             cmd.extend(
@@ -161,19 +162,27 @@ class TournamentRunner:
                 ]
             )
             opponent_side = "black"
+            candidate_side = "white"
             perspective = ResultPerspective.WHITE
 
         if mode.mirror_openings:
             cmd.append("--mirror-openings")
-        self._add_common_args(cmd)
+        self._add_common_args(cmd, visits_side=candidate_side)
         if opponent.nodes > 0:
             cmd.append(f"--{opponent_side}.visits={opponent.nodes}")
         cmd.extend(opponent.extra_args)
         return cmd, perspective
 
-    def _add_common_args(self, cmd: list[str]) -> None:
+    def _add_common_args(
+        self, cmd: list[str], *, visits_side: str | None = None
+    ) -> None:
         if self.config.nodes > 0:
-            cmd.append(f"--visits={self.config.nodes}")
+            visits_arg = (
+                f"--{visits_side}.visits"
+                if visits_side is not None
+                else "--visits"
+            )
+            cmd.append(f"{visits_arg}={self.config.nodes}")
         if self.config.movetime > 0:
             cmd.append(f"--movetime={self.config.movetime}")
         if self.config.opening_book:
