@@ -204,7 +204,14 @@ def _layer_index(tap_name: str) -> int:
 
 def _canonical_tap_name(tap_name: str) -> str:
     parts = tap_name.split("/")
-    if len(parts) >= 3 and parts[0] == "encoders" and parts[1] == "encoders":
-        parts[1] = "layers"
+    if (
+        len(parts) >= 4
+        and parts[0] == "encoders"
+        and parts[1] == "encoders"
+        and parts[2] == "layers"
+    ):
+        return "/".join([parts[0], *parts[2:]])
+    if len(parts) >= 3 and parts[0] == "encoders" and parts[1].isdigit():
+        parts.insert(1, "layers")
         return "/".join(parts)
     return tap_name
