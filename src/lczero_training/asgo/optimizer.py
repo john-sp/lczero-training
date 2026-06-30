@@ -40,22 +40,35 @@ def asgo_optimizer_step(
     new_beta1_product = jnp.asarray(beta1_product) * beta1
     new_beta2_product = jnp.asarray(beta2_product) * beta2
 
-    new_m = jax.tree.map(
-        lambda old_m, grad: beta1 * old_m + (1.0 - beta1) * grad,
-        m,
-        gradient,
-    )
-    new_v = jax.tree.map(
-        lambda old_v, grad: beta2 * old_v + (1.0 - beta2) * jnp.square(grad),
-        v,
-        gradient,
-    )
+    def update_m_leaf(
+        param: jax.Array,
+        old_m: jax.Array,
+        grad: jax.Array,
+    ) -> jax.Array:
+        if _is_compact_zero_for_param(param, grad):
+            return jnp.asarray(0, dtype=param.dtype)
+        return beta1 * old_m + (1.0 - beta1) * grad
+
+    def update_v_leaf(
+        param: jax.Array,
+        old_v: jax.Array,
+        grad: jax.Array,
+    ) -> jax.Array:
+        if _is_compact_zero_for_param(param, grad):
+            return jnp.asarray(0, dtype=param.dtype)
+        return beta2 * old_v + (1.0 - beta2) * jnp.square(grad)
+
+    new_m = jax.tree.map(update_m_leaf, params, m, gradient)
+    new_v = jax.tree.map(update_v_leaf, params, v, gradient)
 
     def update_leaf(
         param: jax.Array,
+        grad: jax.Array,
         m_leaf: jax.Array,
         v_leaf: jax.Array,
     ) -> jax.Array:
+        if _is_compact_zero_for_param(param, grad):
+            return param
         m_hat = m_leaf / (1.0 - new_beta1_product)
         v_hat = v_leaf / (1.0 - new_beta2_product)
         update = m_hat / (jnp.sqrt(v_hat) + epsilon)
@@ -63,7 +76,7 @@ def asgo_optimizer_step(
             update = muon_orthogonalize(update)
         return param + lr * update.astype(param.dtype)
 
-    new_params = jax.tree.map(update_leaf, params, new_m, new_v)
+    new_params = jax.tree.map(update_leaf, params, gradient, new_m, new_v)
     return new_params, new_m, new_v, new_beta1_product, new_beta2_product
 
 
@@ -145,3 +158,7 @@ def _use_muon(
         and update.ndim == 2
         and min(update.shape) >= muon_skip_smaller_than
     )
+
+
+def _is_compact_zero_for_param(param: jax.Array, grad: jax.Array) -> bool:
+    return grad.shape == () and param.shape != ()

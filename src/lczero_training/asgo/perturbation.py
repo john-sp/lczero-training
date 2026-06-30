@@ -101,7 +101,9 @@ class PerturbationManager:
             path_name = _path_to_string(path)
             canonical_name = _canonical_weight_path(path_name)
             if not _selector_includes(self.config.perturb_selector, path_name):
-                return _wrap_like_variable(variable, jnp.zeros_like(weight))
+                return _wrap_like_variable(
+                    variable, jnp.asarray(0, dtype=weight.dtype)
+                )
 
             key = next(keys)
             c = resolve_c(
@@ -403,3 +405,23 @@ def _wrap_like_variable(variable: object, value: jax.Array) -> object:
 
 def _is_array_like(value: object) -> bool:
     return hasattr(value, "shape") and hasattr(value, "dtype")
+
+
+def selected_zero_state(
+    model_params: nnx.State,
+    selector: Message,
+) -> nnx.State:
+    """Returns zero optimizer state, compacting unselected leaves to scalars."""
+
+    def make_zero(path: tuple[object, ...], variable: object) -> object:
+        weight = _variable_value(variable)
+        if not _is_array_like(weight):
+            return variable
+        path_name = _path_to_string(path)
+        if _selector_includes(selector, path_name):
+            return _wrap_like_variable(variable, jnp.zeros_like(weight))
+        return _wrap_like_variable(
+            variable, jnp.asarray(0, dtype=weight.dtype)
+        )
+
+    return nnx.map_state(make_zero, model_params)

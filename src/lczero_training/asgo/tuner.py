@@ -12,6 +12,7 @@ from typing import Callable, Protocol
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 
 from lczero_training.asgo.activation_collector import (
@@ -37,20 +38,19 @@ from lczero_training.asgo.optimizer import (
     asgo_optimizer_step,
     learning_rate_for_iteration,
 )
-from lczero_training.asgo.perturbation import PerturbationManager
+from lczero_training.asgo.perturbation import (
+    PerturbationManager,
+    selected_zero_state,
+)
 from lczero_training.asgo.tournament import TournamentRunner
 from lczero_training.convert.jax_to_leela import (
     LeelaExportOptions,
     jax_to_leela,
 )
-from lczero_training.convert.leela_to_jax import (
-    LeelaImportOptions,
-    leela_to_jax,
-)
 from lczero_training.dataloader import DataLoader, make_dataloader
 from lczero_training.model.model import LczeroModel
 from lczero_training.training.tensorboard import TensorboardLogger
-from proto import hlo_pb2, net_pb2
+from proto import net_pb2
 from proto.root_config_pb2 import RootConfig
 
 logger = logging.getLogger(__name__)
@@ -111,8 +111,24 @@ class AsgoTuner:
             create=False,
             max_to_keep=self.asgo.max_checkpoints,
         )
-        empty_state = self._empty_state(empty_model_params)
-        initial_state = self.checkpoint_mgr.restore_latest(empty_state)
+        compact_empty_state = self._empty_state(
+            empty_model_params, compact_optimizer_state=True
+        )
+        try:
+            initial_state = self.checkpoint_mgr.restore_latest(
+                compact_empty_state
+            )
+        except Exception as err:
+            logger.warning(
+                "Compact ASGO checkpoint restore failed; retrying with "
+                "legacy full-size optimizer state template: %s",
+                err,
+            )
+            initial_state = self.checkpoint_mgr.restore_latest(
+                self._empty_state(
+                    empty_model_params, compact_optimizer_state=False
+                )
+            )
         if initial_state is None:
             raise FileNotFoundError(
                 f"No ASGO checkpoint found in {self.asgo.checkpoint_path}."
@@ -301,17 +317,30 @@ class AsgoTuner:
             tournament_seconds=tournament_time,
         )
         completed_iteration = self.iteration + 1
+        del gradient, prev_params, deltas
+        del elo_diffs, tournament_results, adaptive_masks
         self.checkpoint_mgr.save(self._state_for_next_iteration())
         self._export_current(completed_iteration)
         self._cleanup_temp_files(self.iteration)
         self.iteration = completed_iteration
 
-    def _empty_state(self, model_params: nnx.State) -> AsgoState:
+    def _empty_state(
+        self,
+        model_params: nnx.State,
+        *,
+        compact_optimizer_state: bool,
+    ) -> AsgoState:
+        if compact_optimizer_state:
+            m = selected_zero_state(model_params, self.asgo.perturb_selector)
+            v = selected_zero_state(model_params, self.asgo.perturb_selector)
+        else:
+            m = jax.tree.map(jnp.zeros_like, model_params)
+            v = jax.tree.map(jnp.zeros_like, model_params)
         return AsgoState(
             iteration=0,
             model_params=model_params,
-            m=jax.tree.map(jnp.zeros_like, model_params),
-            v=jax.tree.map(jnp.zeros_like, model_params),
+            m=m,
+            v=v,
             beta1_product=jnp.asarray(1.0, dtype=jnp.float32),
             beta2_product=jnp.asarray(1.0, dtype=jnp.float32),
             rng=jax.random.PRNGKey(0),
@@ -417,18 +446,16 @@ class AsgoTuner:
             adaptive_masks=adaptive_masks,
         )
 
-        params_plus = jax.tree.map(
-            lambda param, diff: param + diff, self.model_params, delta
-        )
-        params_minus = jax.tree.map(
-            lambda param, diff: param - diff, self.model_params, delta
-        )
+        params_plus = _apply_delta(self.model_params, delta, sign=1.0)
         pos_path = self._export_variant(
             params_plus, self.iteration, round_idx, "pos"
         )
+        del params_plus
+        params_minus = _apply_delta(self.model_params, delta, sign=-1.0)
         neg_path = self._export_variant(
             params_minus, self.iteration, round_idx, "neg"
         )
+        del params_minus
         return RoundPreparation(
             round_idx=round_idx,
             subkey=subkey,
@@ -448,7 +475,11 @@ class AsgoTuner:
                 path,
                 training_steps=iteration,
             )
-            logger.info("Exported ASGO model for iteration %d to %s", iteration, path)
+            logger.info(
+                "Exported ASGO model for iteration %d to %s",
+                iteration,
+                path,
+            )
 
     def _export_net(
         self,
@@ -477,12 +508,11 @@ class AsgoTuner:
         training_steps: int,
     ) -> None:
         net = self._export_net(params, training_steps=training_steps)
-        network_bytes = gzip.compress(net.SerializeToString())
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        with open(path, "wb") as f:
-            f.write(network_bytes)
+        with gzip.open(path, "wb") as f:
+            f.write(net.SerializeToString())
 
     def _log_metrics(
         self,
@@ -570,18 +600,8 @@ class AsgoTuner:
     def _export_roundtrip_metrics(
         self, params: nnx.State
     ) -> tuple[float, float]:
-        net = self._export_net(params, training_steps=self.iteration)
-        roundtrip = leela_to_jax(
-            net,
-            LeelaImportOptions(
-                weights_dtype=hlo_pb2.XlaShapeProto.F32,
-                compute_dtype=self.config.model.defaults.compute_dtype,
-            ),
-        )
-        return (
-            _tree_delta_rms(params, roundtrip),
-            _tree_delta_norm(params, roundtrip),
-        )
+        del self
+        return _export_quantization_metrics(params)
 
     def _cleanup_temp_files(self, iteration: int) -> None:
         pattern = os.path.join(
@@ -613,6 +633,20 @@ def _mean(values: Sequence[float]) -> float:
     return sum(values) / len(values)
 
 
+def _apply_delta(
+    params: nnx.State,
+    delta: nnx.State,
+    *,
+    sign: float,
+) -> nnx.State:
+    def apply_leaf(param: jax.Array, diff: jax.Array) -> jax.Array:
+        if _is_compact_zero_for_param(param, diff):
+            return param
+        return param + sign * diff
+
+    return jax.tree.map(apply_leaf, params, delta)
+
+
 def _tree_norm(tree: object) -> float:
     leaves = [_as_array(leaf) for leaf in jax.tree.leaves(tree)]
     arrays = [leaf for leaf in leaves if leaf is not None]
@@ -639,6 +673,52 @@ def _tree_delta_arrays(new_tree: object, old_tree: object) -> list[jax.Array]:
         if new_array is not None and old_array is not None:
             arrays.append(new_array - old_array)
     return arrays
+
+
+def _export_quantization_metrics(params: nnx.State) -> tuple[float, float]:
+    square_sum = 0.0
+    count = 0
+
+    def collect(path: tuple[object, ...], variable: object) -> bool:
+        nonlocal square_sum, count
+        value = _as_array(variable)
+        if value is None:
+            return False
+        original = np.asarray(value, dtype=np.float32)
+        exported = original
+        scale_embedding_plane = (
+            _path_to_string(path) == "embedding/embedding/kernel"
+            and exported.ndim >= 1
+            and exported.shape[0] > 109
+        )
+        if scale_embedding_plane:
+            exported = original.copy()
+            exported[109] /= 99.0
+        roundtrip = _linear16_roundtrip(exported)
+        if scale_embedding_plane:
+            roundtrip[109] *= 99.0
+        diff = original - roundtrip
+        diff64 = diff.astype(np.float64)
+        square_sum += float(np.sum(diff64 * diff64))
+        count += diff.size
+        return False
+
+    nnx.map_state(collect, params)
+    if count == 0:
+        return 0.0, 0.0
+    return float((square_sum / count) ** 0.5), float(square_sum**0.5)
+
+
+def _linear16_roundtrip(values: np.ndarray) -> np.ndarray:
+    min_val = np.min(values)
+    max_val = np.max(values)
+    range_val = max_val - min_val
+    if range_val <= 1e-8:
+        return np.full_like(values, min_val, dtype=np.float32)
+    normalized = (values - min_val) / range_val
+    quantized = np.round(normalized * 65535.0).astype(np.uint16)
+    alpha = quantized.astype(np.float32) / 65535.0
+    return alpha * max_val + (1.0 - alpha) * min_val
 
 
 def _arrays_norm(arrays: Sequence[jax.Array]) -> float:
@@ -687,3 +767,11 @@ def _as_array(value: object) -> jax.Array | None:
     if not (hasattr(value, "shape") and hasattr(value, "dtype")):
         return None
     return jnp.asarray(value)
+
+
+def _is_compact_zero_for_param(param: jax.Array, diff: jax.Array) -> bool:
+    return diff.shape == () and param.shape != ()
+
+
+def _path_to_string(path: tuple[object, ...]) -> str:
+    return "/".join(map(str, path))

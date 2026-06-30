@@ -10,6 +10,7 @@ from flax import nnx, struct
 from google.protobuf import text_format
 
 from lczero_training.asgo.config import hash_config, normalize_asgo_config
+from lczero_training.asgo.perturbation import selected_zero_state
 from lczero_training.training.init import _load_lc0_model_state
 from proto.root_config_pb2 import RootConfig
 
@@ -112,8 +113,8 @@ def asgo_init(
         ignore_config_mismatch,
     )
 
-    m = jax.tree.map(jnp.zeros_like, model_params)
-    v = jax.tree.map(jnp.zeros_like, model_params)
+    m = selected_zero_state(model_params, asgo_config.perturb_selector)
+    v = selected_zero_state(model_params, asgo_config.perturb_selector)
     state = AsgoState(
         iteration=0,
         model_params=model_params,
