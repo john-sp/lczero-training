@@ -1,10 +1,21 @@
+import dataclasses
 import enum
+import json
 import logging
+import os
 import re
+import shutil
 import shlex
 import subprocess
-from collections.abc import Sequence
+import threading
+import time
+import urllib.parse
+import uuid
+from collections.abc import Callable, Sequence
 from concurrent import futures
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import TypeVar
 
 from google.protobuf.message import Message
 
@@ -18,6 +29,7 @@ from lczero_training.asgo.elo import (
 logger = logging.getLogger(__name__)
 
 _ASGO_TUNED_BLACK = 1
+_ResultT = TypeVar("_ResultT")
 
 
 class ResultPerspective(enum.Enum):
@@ -41,6 +53,29 @@ class TournamentError(RuntimeError):
 
 class TournamentTimeoutError(TournamentError):
     """Raised when lc0 selfplay times out."""
+
+
+@dataclasses.dataclass(frozen=True)
+class RemoteTournamentTask:
+    """One lc0 command set assigned to a remote worker."""
+
+    cmd: list[str]
+    perspective: ResultPerspective
+    mirror_openings: bool
+    timeout_seconds: float
+
+
+@dataclasses.dataclass
+class _RemoteJob:
+    job_id: str
+    payload: dict[str, object]
+    timeout_seconds: float
+    future: futures.Future[dict[str, object]]
+    status: str = "pending"
+    attempts: int = 0
+    assigned_worker: str = ""
+    started_monotonic: float = 0.0
+    error: str = ""
 
 
 class TournamentRunner:
@@ -333,6 +368,602 @@ class TournamentRunner:
 
     def cleanup(self) -> None:
         """Hook for future runner-owned temporary resources."""
+
+
+class RemoteTournamentRunner(TournamentRunner):
+    """Runs whole ASGO rounds on remote lc0 workers."""
+
+    def __init__(
+        self,
+        config: Message,
+        lc0_path: str,
+        work_dir: str,
+        *,
+        remote_config: Message,
+        supports_opening_seed: bool = True,
+    ) -> None:
+        super().__init__(
+            config=config,
+            lc0_path=lc0_path,
+            work_dir=work_dir,
+            supports_opening_seed=supports_opening_seed,
+        )
+        self.remote_config = remote_config
+        self._server = RemoteTournamentServer(
+            listen_host=remote_config.listen_host,
+            port=remote_config.port,
+            auth_token=remote_config.auth_token,
+            long_poll_seconds=remote_config.long_poll_seconds,
+            max_retries=remote_config.max_retries,
+        )
+        self._server.start()
+        logger.info(
+            "ASGO remote tournament server listening on %s",
+            self.server_url,
+        )
+
+    @property
+    def server_url(self) -> str:
+        return self._server.url
+
+    def evaluate_pair(
+        self,
+        pos_weights_path: str,
+        neg_weights_path: str,
+    ) -> DirectTournamentResult:
+        return self.submit_pair(pos_weights_path, neg_weights_path).result()
+
+    def submit_pair(
+        self,
+        pos_weights_path: str,
+        neg_weights_path: str,
+    ) -> futures.Future[DirectTournamentResult]:
+        """Queues theta+ vs theta- as one remote ASGO round."""
+        cmd = self._build_direct_command(pos_weights_path, neg_weights_path)
+        task = RemoteTournamentTask(
+            cmd=cmd,
+            perspective=ResultPerspective.PLAYER1,
+            mirror_openings=self.config.direct_comparison.mirror_openings,
+            timeout_seconds=float(self.config.timeout_seconds),
+        )
+        return self._submit_round(
+            tasks=[task],
+            file_paths=self._round_files(pos_weights_path, neg_weights_path),
+            build_result=_direct_result_from_payload,
+        )
+
+    def evaluate_against_opponents(
+        self,
+        pos_weights_path: str,
+        neg_weights_path: str,
+        rng: object | None = None,
+    ) -> OpponentEvaluationResult:
+        return self.submit_against_opponents(
+            pos_weights_path,
+            neg_weights_path,
+            rng=rng,
+        ).result()
+
+    def submit_against_opponents(
+        self,
+        pos_weights_path: str,
+        neg_weights_path: str,
+        rng: object | None = None,
+    ) -> futures.Future[OpponentEvaluationResult]:
+        """Queues all fixed-opponent commands for one ASGO round."""
+        del rng
+        tasks: list[RemoteTournamentTask] = []
+        opponents = list(self.config.fixed_opponent.opponent)
+        for opponent in opponents:
+            pos_cmd, perspective = self._build_fixed_opponent_command(
+                pos_weights_path, opponent
+            )
+            neg_cmd, neg_perspective = self._build_fixed_opponent_command(
+                neg_weights_path, opponent
+            )
+            if neg_perspective != perspective:
+                raise TournamentError("Mismatched fixed-opponent perspective.")
+            tasks.append(
+                RemoteTournamentTask(
+                    cmd=pos_cmd,
+                    perspective=perspective,
+                    mirror_openings=self.config.fixed_opponent.mirror_openings,
+                    timeout_seconds=float(self.config.timeout_seconds),
+                )
+            )
+            tasks.append(
+                RemoteTournamentTask(
+                    cmd=neg_cmd,
+                    perspective=perspective,
+                    mirror_openings=self.config.fixed_opponent.mirror_openings,
+                    timeout_seconds=float(self.config.timeout_seconds),
+                )
+            )
+
+        return self._submit_round(
+            tasks=tasks,
+            file_paths=self._round_files(
+                pos_weights_path,
+                neg_weights_path,
+                *(opponent.weights for opponent in opponents),
+            ),
+            build_result=lambda payload: _opponent_result_from_payload(
+                payload,
+                opponents,
+            ),
+        )
+
+    def _round_files(self, *paths: str) -> list[str]:
+        files = [path for path in paths if path]
+        if self.config.opening_book:
+            files.append(self.config.opening_book)
+        return files
+
+    def _submit_round(
+        self,
+        *,
+        tasks: Sequence[RemoteTournamentTask],
+        file_paths: Sequence[str],
+        build_result: Callable[[dict[str, object]], _ResultT],
+    ) -> futures.Future[_ResultT]:
+        raw_future = self._server.submit(
+            tasks=[_remote_task_payload(task) for task in tasks],
+            file_paths=file_paths,
+            timeout_seconds=self._remote_job_timeout(len(tasks)),
+        )
+        result_future: futures.Future[_ResultT] = futures.Future()
+
+        def complete(done: futures.Future[dict[str, object]]) -> None:
+            try:
+                result_future.set_result(build_result(done.result()))
+            except Exception as exc:
+                result_future.set_exception(exc)
+
+        raw_future.add_done_callback(complete)
+        return result_future
+
+    def _remote_job_timeout(self, task_count: int) -> float:
+        if self.remote_config.job_timeout_seconds > 0:
+            return float(self.remote_config.job_timeout_seconds)
+        return float(self.config.timeout_seconds * max(1, task_count) + 60)
+
+    def cleanup(self) -> None:
+        self._server.stop()
+
+
+class RemoteTournamentServer:
+    """Small HTTP broker for remote ASGO tournament workers."""
+
+    def __init__(
+        self,
+        *,
+        listen_host: str,
+        port: int,
+        auth_token: str,
+        long_poll_seconds: float,
+        max_retries: int,
+    ) -> None:
+        self.listen_host = listen_host
+        self.port = port
+        self.auth_token = auth_token
+        self.long_poll_seconds = long_poll_seconds
+        self.max_retries = max_retries
+        self._condition = threading.Condition()
+        self._jobs: dict[str, _RemoteJob] = {}
+        self._job_order: list[str] = []
+        self._files: dict[str, str] = {}
+        self._httpd: _RemoteHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._watchdog_thread: threading.Thread | None = None
+
+    @property
+    def url(self) -> str:
+        if self._httpd is None:
+            return f"http://{self.listen_host}:{self.port}"
+        host, port = self._httpd.server_address[:2]
+        return f"http://{host}:{port}"
+
+    def start(self) -> None:
+        self._stop_event.clear()
+        handler = _make_remote_handler(self)
+        self._httpd = _RemoteHTTPServer(
+            (self.listen_host, self.port),
+            handler,
+        )
+        self._thread = threading.Thread(
+            target=self._httpd.serve_forever,
+            name="asgo-remote-tournament-server",
+            daemon=True,
+        )
+        self._thread.start()
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop,
+            name="asgo-remote-tournament-watchdog",
+            daemon=True,
+        )
+        self._watchdog_thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._httpd is not None:
+            self._httpd.shutdown()
+            self._httpd.server_close()
+            self._httpd = None
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+        if self._watchdog_thread is not None:
+            self._watchdog_thread.join(timeout=5.0)
+            self._watchdog_thread = None
+        with self._condition:
+            for job in self._jobs.values():
+                if not job.future.done():
+                    job.future.cancel()
+            self._condition.notify_all()
+
+    def submit(
+        self,
+        *,
+        tasks: Sequence[dict[str, object]],
+        file_paths: Sequence[str],
+        timeout_seconds: float,
+    ) -> futures.Future[dict[str, object]]:
+        job_id = uuid.uuid4().hex
+        file_entries, path_rewrites = self._register_files(job_id, file_paths)
+        future: futures.Future[dict[str, object]] = futures.Future()
+        payload = {
+            "job_id": job_id,
+            "tasks": list(tasks),
+            "files": file_entries,
+            "path_rewrites": path_rewrites,
+        }
+        job = _RemoteJob(
+            job_id=job_id,
+            payload=payload,
+            timeout_seconds=timeout_seconds,
+            future=future,
+        )
+        with self._condition:
+            self._jobs[job_id] = job
+            self._job_order.append(job_id)
+            self._condition.notify_all()
+        return future
+
+    def claim(self, worker_id: str) -> dict[str, object] | None:
+        deadline = time.monotonic() + self.long_poll_seconds
+        with self._condition:
+            while True:
+                self._expire_running_jobs_locked()
+                for job_id in self._job_order:
+                    job = self._jobs[job_id]
+                    if job.status != "pending":
+                        continue
+                    job.status = "running"
+                    job.attempts += 1
+                    job.assigned_worker = worker_id
+                    job.started_monotonic = time.monotonic()
+                    logger.info(
+                        "Assigned ASGO remote job %s to worker %s "
+                        "(attempt %d).",
+                        job.job_id,
+                        worker_id,
+                        job.attempts,
+                    )
+                    return dict(job.payload)
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._condition.wait(remaining)
+
+    def complete(
+        self,
+        *,
+        job_id: str,
+        worker_id: str,
+        payload: dict[str, object],
+    ) -> tuple[bool, str]:
+        with self._condition:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return False, f"Unknown job {job_id}."
+            if job.status != "running":
+                return False, f"Job {job_id} is not running."
+            if job.assigned_worker and job.assigned_worker != worker_id:
+                return False, f"Job {job_id} is assigned to another worker."
+
+            if bool(payload.get("ok")):
+                job.status = "done"
+                if not job.future.done():
+                    job.future.set_result(payload)
+                self._forget_job_files_locked(job)
+                logger.info("Completed ASGO remote job %s.", job_id)
+                return True, ""
+
+            error = str(payload.get("error") or "remote worker failed")
+            logger.warning("ASGO remote job %s failed: %s", job_id, error)
+            self._retry_or_fail_locked(job, TournamentError(error))
+            self._condition.notify_all()
+            return True, ""
+
+    def file_path(self, file_id: str) -> str | None:
+        with self._condition:
+            return self._files.get(file_id)
+
+    def _register_files(
+        self,
+        job_id: str,
+        file_paths: Sequence[str],
+    ) -> tuple[list[dict[str, object]], list[dict[str, str]]]:
+        unique_paths = _unique_paths(file_paths)
+        file_entries: list[dict[str, object]] = []
+        path_rewrites: list[dict[str, str]] = []
+        for idx, path in enumerate(unique_paths):
+            if not os.path.isfile(path):
+                raise TournamentError(f"Remote tournament file missing: {path}")
+            file_id = f"{job_id}-{idx}"
+            filename = f"{idx}-{os.path.basename(path) or 'file'}"
+            file_entries.append(
+                {
+                    "id": file_id,
+                    "name": filename,
+                    "size": os.path.getsize(path),
+                }
+            )
+            path_rewrites.append({"from": path, "file_id": file_id})
+            with self._condition:
+                self._files[file_id] = path
+        return file_entries, path_rewrites
+
+    def _expire_running_jobs_locked(self) -> None:
+        now = time.monotonic()
+        for job in self._jobs.values():
+            if job.status != "running":
+                continue
+            if now - job.started_monotonic < job.timeout_seconds:
+                continue
+            error = TournamentTimeoutError(
+                f"Remote tournament job {job.job_id} timed out."
+            )
+            logger.warning("%s", error)
+            self._retry_or_fail_locked(job, error)
+
+    def _retry_or_fail_locked(
+        self,
+        job: _RemoteJob,
+        error: TournamentError,
+    ) -> None:
+        job.error = str(error)
+        job.assigned_worker = ""
+        job.started_monotonic = 0.0
+        if job.attempts <= self.max_retries:
+            job.status = "pending"
+            return
+        job.status = "failed"
+        if not job.future.done():
+            job.future.set_exception(error)
+        self._forget_job_files_locked(job)
+
+    def _watchdog_loop(self) -> None:
+        while not self._stop_event.wait(1.0):
+            with self._condition:
+                self._expire_running_jobs_locked()
+                self._condition.notify_all()
+
+    def _forget_job_files_locked(self, job: _RemoteJob) -> None:
+        files = job.payload.get("files", [])
+        if not isinstance(files, list):
+            return
+        for file_info in files:
+            if isinstance(file_info, dict):
+                file_id = file_info.get("id")
+                if isinstance(file_id, str):
+                    self._files.pop(file_id, None)
+
+
+class _RemoteHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+
+def _make_remote_handler(
+    server: RemoteTournamentServer,
+) -> type[BaseHTTPRequestHandler]:
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if not self._authorized():
+                return
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path == "/health":
+                self._send_json({"ok": True})
+                return
+            prefix = "/v1/files/"
+            if parsed.path.startswith(prefix):
+                self._send_file(parsed.path[len(prefix) :])
+                return
+            self._send_json(
+                {"ok": False, "error": "not found"},
+                status=HTTPStatus.NOT_FOUND,
+            )
+
+        def do_POST(self) -> None:
+            if not self._authorized():
+                return
+            parsed = urllib.parse.urlparse(self.path)
+            body = self._read_json()
+            if parsed.path == "/v1/jobs/claim":
+                worker_id = str(body.get("worker_id") or "")
+                if not worker_id:
+                    self._send_json(
+                        {"ok": False, "error": "worker_id is required"},
+                        status=HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+                job = server.claim(worker_id)
+                if job is None:
+                    self._send_json({"ok": True, "status": "no_job"})
+                else:
+                    self._send_json(
+                        {"ok": True, "status": "job", "job": job}
+                    )
+                return
+
+            suffix = "/complete"
+            if parsed.path.startswith("/v1/jobs/") and parsed.path.endswith(
+                suffix
+            ):
+                job_id = parsed.path[len("/v1/jobs/") : -len(suffix)]
+                worker_id = str(body.get("worker_id") or "")
+                ok, error = server.complete(
+                    job_id=job_id,
+                    worker_id=worker_id,
+                    payload=body,
+                )
+                status = HTTPStatus.OK if ok else HTTPStatus.BAD_REQUEST
+                self._send_json({"ok": ok, "error": error}, status=status)
+                return
+
+            self._send_json(
+                {"ok": False, "error": "not found"},
+                status=HTTPStatus.NOT_FOUND,
+            )
+
+        def log_message(self, format: str, *args: object) -> None:
+            logger.debug("ASGO remote HTTP: " + format, *args)
+
+        def _authorized(self) -> bool:
+            if not server.auth_token:
+                return True
+            expected = f"Bearer {server.auth_token}"
+            if self.headers.get("Authorization") == expected:
+                return True
+            self._send_json(
+                {"ok": False, "error": "unauthorized"},
+                status=HTTPStatus.UNAUTHORIZED,
+            )
+            return False
+
+        def _read_json(self) -> dict[str, object]:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0:
+                return {}
+            data = self.rfile.read(length)
+            return json.loads(data.decode("utf-8"))
+
+        def _send_json(
+            self,
+            payload: dict[str, object],
+            *,
+            status: HTTPStatus = HTTPStatus.OK,
+        ) -> None:
+            data = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _send_file(self, file_id: str) -> None:
+            file_id = urllib.parse.unquote(file_id)
+            path = server.file_path(file_id)
+            if path is None:
+                self._send_json(
+                    {"ok": False, "error": "unknown file"},
+                    status=HTTPStatus.NOT_FOUND,
+                )
+                return
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(os.path.getsize(path)))
+            self.end_headers()
+            with open(path, "rb") as f:
+                shutil.copyfileobj(f, self.wfile)
+
+    return Handler
+
+
+def _remote_task_payload(
+    task: RemoteTournamentTask,
+) -> dict[str, object]:
+    return {
+        "cmd": list(task.cmd),
+        "perspective": task.perspective.name,
+        "mirror_openings": task.mirror_openings,
+        "timeout_seconds": task.timeout_seconds,
+    }
+
+
+def _direct_result_from_payload(
+    payload: dict[str, object],
+) -> DirectTournamentResult:
+    results = _payload_results(payload, expected_count=1)
+    return _direct_result_from_dict(results[0])
+
+
+def _opponent_result_from_payload(
+    payload: dict[str, object],
+    opponents: Sequence[Message],
+) -> OpponentEvaluationResult:
+    results = _payload_results(payload, expected_count=2 * len(opponents))
+    comparisons: list[tuple[float, OpponentComparisonResult]] = []
+    for idx, opponent in enumerate(opponents):
+        pos_result = _direct_result_from_dict(results[2 * idx])
+        neg_result = _direct_result_from_dict(results[2 * idx + 1])
+        comparisons.append(
+            (
+                opponent.weight,
+                OpponentComparisonResult(
+                    pos_result=pos_result,
+                    neg_result=neg_result,
+                    opponent_name=opponent.name,
+                ),
+            )
+        )
+    return combine_opponent_results(comparisons)
+
+
+def _payload_results(
+    payload: dict[str, object],
+    *,
+    expected_count: int,
+) -> list[dict[str, object]]:
+    results = payload.get("results")
+    if not isinstance(results, list):
+        raise TournamentError("Remote worker response did not contain results.")
+    if len(results) != expected_count:
+        raise TournamentError(
+            "Remote worker returned "
+            f"{len(results)} result(s), expected {expected_count}."
+        )
+    checked = []
+    for result in results:
+        if not isinstance(result, dict):
+            raise TournamentError("Remote worker result must be an object.")
+        checked.append(result)
+    return checked
+
+
+def _direct_result_from_dict(data: dict[str, object]) -> DirectTournamentResult:
+    try:
+        return DirectTournamentResult(
+            wins=int(data["wins"]),
+            draws=int(data["draws"]),
+            losses=int(data["losses"]),
+            npm=float(data.get("npm", 0.0)),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TournamentError("Invalid remote tournament result.") from exc
+
+
+def _unique_paths(paths: Sequence[str]) -> list[str]:
+    seen = set()
+    result = []
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        result.append(path)
+    return result
 
 
 def _get_wld_and_npm(

@@ -31,7 +31,8 @@ enum AsgoTunedSide {
 
 // Top-level ASGO tuning configuration.
 message AsgoConfig {
-  // Path to the lc0 binary.
+  // Path to the lc0 binary. Optional when tournament.remote is set because
+  // workers provide their lc0 path on startup.
   optional string lc0_path = 1;
 
   // Which weights to perturb. Reuses WeightsSelector from training_config.
@@ -223,6 +224,35 @@ message AsgoTournamentConfig {
     DirectComparisonMode direct_comparison = 10;
     FixedOpponentMode fixed_opponent = 11;
   }
+
+  // Remote execution settings. When present, lc0 tournaments are executed by
+  // workers that connect to the JAX host and claim whole ASGO rounds.
+  optional AsgoRemoteTournamentConfig remote = 12;
+}
+
+// Host-side HTTP work server for remote lc0 evaluation.
+message AsgoRemoteTournamentConfig {
+  // Address the JAX host binds. Use 127.0.0.1 when workers connect through an
+  // SSH tunnel, or 0.0.0.0 when the port is otherwise reachable.
+  optional string listen_host = 1 [default = "127.0.0.1"];
+
+  // Port the JAX host binds. Workers receive this as hostname:port, usually
+  // through an SSH tunnel.
+  optional int32 port = 2 [default = 8765];
+
+  // Optional bearer token required from workers.
+  optional string auth_token = 3;
+
+  // Seconds a worker claim request waits for work before returning no_job.
+  optional float long_poll_seconds = 4 [default = 5.0];
+
+  // Seconds before an assigned remote round is retried. 0 means derive the
+  // lease from tournament.timeout_seconds and the number of lc0 invocations in
+  // the round.
+  optional int32 job_timeout_seconds = 5 [default = 0];
+
+  // Number of times a failed or timed-out round may be requeued.
+  optional int32 max_retries = 6 [default = 1];
 }
 
 // Low-variance mode for ordinary tuning: theta+ and theta- play each other.

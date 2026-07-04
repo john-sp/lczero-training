@@ -78,9 +78,18 @@ def validate_asgo_config(
     """
     errors: list[str] = []
 
-    if not getattr(config, "lc0_path", ""):
+    remote_tournament = (
+        _has_field(config, "tournament")
+        and _has_field(config.tournament, "remote")
+    )
+    if not getattr(config, "lc0_path", "") and not remote_tournament:
         errors.append("asgo.lc0_path must be set.")
-    elif validate_paths and not os.path.isfile(config.lc0_path):
+    elif (
+        getattr(config, "lc0_path", "")
+        and validate_paths
+        and not remote_tournament
+        and not os.path.isfile(config.lc0_path)
+    ):
         errors.append(f"asgo.lc0_path does not exist: {config.lc0_path}")
 
     if not _has_field(config, "perturb_selector"):
@@ -185,6 +194,7 @@ def _semantic_hash_config(config: Message) -> Message:
         _clear_if_present(tournament, "gpu")
         _clear_if_present(tournament, "timeout_seconds")
         _clear_if_present(tournament, "lc0_parallelism")
+        _clear_if_present(tournament, "remote")
     return copied
 
 
@@ -262,6 +272,8 @@ def _validate_tournament(
             validate_paths,
             override_lc0_config_conflict,
         )
+    if _has_field(tournament, "remote"):
+        _validate_remote_tournament(errors, tournament.remote)
 
 
 def _validate_fixed_opponent(
@@ -294,6 +306,27 @@ def _validate_fixed_opponent(
             f"Opponent {label} extra_args",
             opponent.extra_args,
             override_lc0_config_conflict,
+        )
+
+
+def _validate_remote_tournament(errors: list[str], remote: Message) -> None:
+    if not remote.listen_host:
+        errors.append("asgo.tournament.remote.listen_host must be set.")
+    if not 0 < remote.port <= 65535:
+        errors.append("asgo.tournament.remote.port must be in [1, 65535].")
+    _check_positive(
+        errors,
+        "asgo.tournament.remote.long_poll_seconds",
+        remote.long_poll_seconds,
+    )
+    if remote.job_timeout_seconds < 0:
+        errors.append(
+            "asgo.tournament.remote.job_timeout_seconds must be "
+            "non-negative."
+        )
+    if remote.max_retries < 0:
+        errors.append(
+            "asgo.tournament.remote.max_retries must be non-negative."
         )
 
 

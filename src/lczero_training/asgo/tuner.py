@@ -8,7 +8,7 @@ import signal
 import time
 from collections.abc import Sequence
 from concurrent import futures
-from typing import Callable, Protocol
+from typing import Callable, Protocol, cast
 
 import jax
 import jax.numpy as jnp
@@ -42,7 +42,10 @@ from lczero_training.asgo.perturbation import (
     PerturbationManager,
     selected_zero_state,
 )
-from lczero_training.asgo.tournament import TournamentRunner
+from lczero_training.asgo.tournament import (
+    RemoteTournamentRunner,
+    TournamentRunner,
+)
 from lczero_training.convert.jax_to_leela import (
     LeelaExportOptions,
     jax_to_leela,
@@ -61,6 +64,9 @@ class TournamentMetricResult(Protocol):
     draws: int
     losses: int
     npm: float
+
+    @property
+    def elo_diff(self) -> float: ...
 
 
 @dataclasses.dataclass(frozen=True)
@@ -218,11 +224,7 @@ class AsgoTuner:
             rng=self.rng,
             activation_bases=initial_state.activation_bases,
         )
-        self.tournament = TournamentRunner(
-            config=self.asgo.tournament,
-            lc0_path=self.asgo.lc0_path,
-            work_dir=self.asgo.checkpoint_path,
-        )
+        self.tournament = self._create_tournament_runner()
         self.summary_writer = self._create_summary_writer()
         self._activation_cache = self._populate_activation_cache()
         self._agzo_cache_positions = activation_cache_position_count(
@@ -282,59 +284,22 @@ class AsgoTuner:
             self.rng, subkey = jax.random.split(self.rng)
             round_keys.append(subkey)
 
-        with futures.ThreadPoolExecutor(max_workers=1) as export_pool:
-            prepare_future = export_pool.submit(
-                self._prepare_round,
-                0,
-                round_keys[0],
-                adaptive_masks,
+        if isinstance(self.tournament, RemoteTournamentRunner):
+            tournament_time += self._run_remote_tournament_rounds(
+                round_keys=round_keys,
+                adaptive_masks=adaptive_masks,
+                deltas=deltas,
+                elo_diffs=elo_diffs,
+                tournament_results=tournament_results,
             )
-            for round_idx in range(self.asgo.rounds_per_iteration):
-                logger.info(
-                    "ASGO iteration %d round %d/%d",
-                    self.iteration,
-                    round_idx + 1,
-                    self.asgo.rounds_per_iteration,
-                )
-
-                prepared = prepare_future.result()
-                if prepared.round_idx != round_idx:
-                    raise RuntimeError(
-                        "ASGO round preparation completed out of order."
-                    )
-                deltas.append(prepared.delta)
-
-                next_round_idx = round_idx + 1
-                if next_round_idx < self.asgo.rounds_per_iteration:
-                    prepare_future = export_pool.submit(
-                        self._prepare_round,
-                        next_round_idx,
-                        round_keys[next_round_idx],
-                        adaptive_masks,
-                    )
-
-                eval_start = time.time()
-                if self.asgo.tournament.HasField("fixed_opponent"):
-                    result = self.tournament.evaluate_against_opponents(
-                        pos_weights_path=prepared.pos_path,
-                        neg_weights_path=prepared.neg_path,
-                        rng=prepared.subkey,
-                    )
-                else:
-                    result = self.tournament.evaluate_pair(
-                        pos_weights_path=prepared.pos_path,
-                        neg_weights_path=prepared.neg_path,
-                    )
-                tournament_time += time.time() - eval_start
-                elo_diffs.append(result.elo_diff)
-                tournament_results.append(result)
-                logger.info(
-                    "ASGO round result: elo=%+.1f WDL=%d/%d/%d",
-                    result.elo_diff,
-                    result.wins,
-                    result.draws,
-                    result.losses,
-                )
+        else:
+            tournament_time += self._run_local_tournament_rounds(
+                round_keys=round_keys,
+                adaptive_masks=adaptive_masks,
+                deltas=deltas,
+                elo_diffs=elo_diffs,
+                tournament_results=tournament_results,
+            )
 
         gradient = compute_gradient(
             deltas=deltas,
@@ -388,6 +353,196 @@ class AsgoTuner:
         self._export_current(completed_iteration)
         self._cleanup_temp_files(self.iteration)
         self.iteration = completed_iteration
+
+    def _create_tournament_runner(self) -> TournamentRunner:
+        lc0_path = self.asgo.lc0_path or "lc0"
+        if _has_field(self.asgo.tournament, "remote"):
+            return RemoteTournamentRunner(
+                config=self.asgo.tournament,
+                lc0_path=lc0_path,
+                work_dir=self.asgo.checkpoint_path,
+                remote_config=self.asgo.tournament.remote,
+            )
+        return TournamentRunner(
+            config=self.asgo.tournament,
+            lc0_path=lc0_path,
+            work_dir=self.asgo.checkpoint_path,
+        )
+
+    def _run_local_tournament_rounds(
+        self,
+        *,
+        round_keys: Sequence[jax.Array],
+        adaptive_masks: dict[str, jax.Array] | None,
+        deltas: list[nnx.State],
+        elo_diffs: list[float],
+        tournament_results: list[TournamentMetricResult],
+    ) -> float:
+        tournament_time = 0.0
+        with futures.ThreadPoolExecutor(max_workers=1) as export_pool:
+            prepare_future = export_pool.submit(
+                self._prepare_round,
+                0,
+                round_keys[0],
+                adaptive_masks,
+            )
+            for round_idx in range(self.asgo.rounds_per_iteration):
+                prepared = self._finish_prepared_round(
+                    prepare_future,
+                    round_idx,
+                    deltas,
+                )
+                next_round_idx = round_idx + 1
+                if next_round_idx < self.asgo.rounds_per_iteration:
+                    prepare_future = export_pool.submit(
+                        self._prepare_round,
+                        next_round_idx,
+                        round_keys[next_round_idx],
+                        adaptive_masks,
+                    )
+
+                eval_start = time.time()
+                result = self._evaluate_prepared_round(prepared)
+                tournament_time += time.time() - eval_start
+                self._record_round_result(
+                    result,
+                    elo_diffs,
+                    tournament_results,
+                )
+        return tournament_time
+
+    def _run_remote_tournament_rounds(
+        self,
+        *,
+        round_keys: Sequence[jax.Array],
+        adaptive_masks: dict[str, jax.Array] | None,
+        deltas: list[nnx.State],
+        elo_diffs: list[float],
+        tournament_results: list[TournamentMetricResult],
+    ) -> float:
+        submitted: list[
+            tuple[int, futures.Future[TournamentMetricResult], float]
+        ] = []
+        with futures.ThreadPoolExecutor(max_workers=1) as export_pool:
+            prepare_future = export_pool.submit(
+                self._prepare_round,
+                0,
+                round_keys[0],
+                adaptive_masks,
+            )
+            for round_idx in range(self.asgo.rounds_per_iteration):
+                prepared = self._finish_prepared_round(
+                    prepare_future,
+                    round_idx,
+                    deltas,
+                )
+                next_round_idx = round_idx + 1
+                if next_round_idx < self.asgo.rounds_per_iteration:
+                    prepare_future = export_pool.submit(
+                        self._prepare_round,
+                        next_round_idx,
+                        round_keys[next_round_idx],
+                        adaptive_masks,
+                    )
+
+                eval_start = time.time()
+                submitted.append(
+                    (
+                        round_idx,
+                        self._submit_prepared_remote_round(prepared),
+                        eval_start,
+                    )
+                )
+                logger.info(
+                    "Submitted ASGO iteration %d round %d/%d remotely.",
+                    self.iteration,
+                    round_idx + 1,
+                    self.asgo.rounds_per_iteration,
+                )
+
+        tournament_time = 0.0
+        for round_idx, result_future, eval_start in submitted:
+            logger.info(
+                "Waiting for ASGO iteration %d remote round %d/%d.",
+                self.iteration,
+                round_idx + 1,
+                self.asgo.rounds_per_iteration,
+            )
+            result = result_future.result()
+            tournament_time += time.time() - eval_start
+            self._record_round_result(result, elo_diffs, tournament_results)
+        return tournament_time
+
+    def _finish_prepared_round(
+        self,
+        prepare_future: futures.Future[RoundPreparation],
+        round_idx: int,
+        deltas: list[nnx.State],
+    ) -> RoundPreparation:
+        logger.info(
+            "ASGO iteration %d round %d/%d",
+            self.iteration,
+            round_idx + 1,
+            self.asgo.rounds_per_iteration,
+        )
+        prepared = prepare_future.result()
+        if prepared.round_idx != round_idx:
+            raise RuntimeError("ASGO round preparation completed out of order.")
+        deltas.append(prepared.delta)
+        return prepared
+
+    def _evaluate_prepared_round(
+        self,
+        prepared: RoundPreparation,
+    ) -> TournamentMetricResult:
+        if self.asgo.tournament.HasField("fixed_opponent"):
+            return self.tournament.evaluate_against_opponents(
+                pos_weights_path=prepared.pos_path,
+                neg_weights_path=prepared.neg_path,
+                rng=prepared.subkey,
+            )
+        return self.tournament.evaluate_pair(
+            pos_weights_path=prepared.pos_path,
+            neg_weights_path=prepared.neg_path,
+        )
+
+    def _submit_prepared_remote_round(
+        self,
+        prepared: RoundPreparation,
+    ) -> futures.Future[TournamentMetricResult]:
+        tournament = cast(RemoteTournamentRunner, self.tournament)
+        if self.asgo.tournament.HasField("fixed_opponent"):
+            return cast(
+                futures.Future[TournamentMetricResult],
+                tournament.submit_against_opponents(
+                    pos_weights_path=prepared.pos_path,
+                    neg_weights_path=prepared.neg_path,
+                    rng=prepared.subkey,
+                ),
+            )
+        return cast(
+            futures.Future[TournamentMetricResult],
+            tournament.submit_pair(
+                pos_weights_path=prepared.pos_path,
+                neg_weights_path=prepared.neg_path,
+            ),
+        )
+
+    def _record_round_result(
+        self,
+        result: TournamentMetricResult,
+        elo_diffs: list[float],
+        tournament_results: list[TournamentMetricResult],
+    ) -> None:
+        elo_diffs.append(result.elo_diff)
+        tournament_results.append(result)
+        logger.info(
+            "ASGO round result: elo=%+.1f WDL=%d/%d/%d",
+            result.elo_diff,
+            result.wins,
+            result.draws,
+            result.losses,
+        )
 
     def _empty_state(
         self,
@@ -840,3 +995,13 @@ def _is_compact_zero_for_param(param: jax.Array, diff: jax.Array) -> bool:
 
 def _path_to_string(path: tuple[object, ...]) -> str:
     return "/".join(map(str, path))
+
+
+def _has_field(message: object, field_name: str) -> bool:
+    descriptor = getattr(message, "DESCRIPTOR", None)
+    if descriptor is None or field_name not in descriptor.fields_by_name:
+        return False
+    has_field = getattr(message, "HasField", None)
+    if not callable(has_field):
+        return False
+    return bool(has_field(field_name))
