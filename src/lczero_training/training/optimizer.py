@@ -14,6 +14,7 @@ import optax.contrib
 _STATES_WITH_COUNT = (
     optax.ScaleByAdamState,
     optax.ScaleByScheduleState,
+    optax.contrib.MuonState,
 )
 
 
