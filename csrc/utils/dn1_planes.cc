@@ -27,13 +27,449 @@
 
 #include "utils/dn1_planes.h"
 
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cmath>
+#include <span>
+#include <vector>
+
+#include "absl/types/span.h"
 #include "chess/board.h"
+#include "chess/types.h"
 #include "loader/frame_type.h"
 #include "neural/decoder.h"
 #include "neural/encoder.h"
 #include "trainingdata/reader.h"
+#include "utils/bititer.h"
+#include "utils/exception.h"
 
 namespace lczero::training {
+
+namespace {
+
+Square SingleSquare(BitBoard input) {
+  for (auto sq : input) {
+    return sq;
+  }
+  assert(false);
+  return Square();
+}
+
+constexpr bool IsOnBoard(int file, int rank) {
+  return file >= 0 && file < 8 && rank >= 0 && rank < 8;
+}
+
+void AddAttack(std::array<uint8_t, 64>& counts, Square square) {
+  const auto idx = square.as_idx();
+  if (counts[idx] < 255) ++counts[idx];
+}
+
+void AddSlidingAttacks(std::array<uint8_t, 64>& counts, Square square,
+                       absl::Span<const std::pair<int, int>> directions,
+                       const BitBoard& occupancy) {
+  int file = square.file().idx;
+  int rank = square.rank().idx;
+  for (const auto& [df, dr] : directions) {
+    int f = file + df;
+    int r = rank + dr;
+    while (IsOnBoard(f, r)) {
+      Square target(File::FromIdx(f), Rank::FromIdx(r));
+      AddAttack(counts, target);
+      if (occupancy.get(target)) break;
+      f += df;
+      r += dr;
+    }
+  }
+}
+
+std::array<uint8_t, 64> ComputeAttackCounts(const ChessBoard& board,
+                                            const BitBoard& side_pieces,
+                                            bool side_is_ours) {
+  std::array<uint8_t, 64> counts{};
+  const BitBoard occupancy = board.ours() | board.theirs();
+
+  const BitBoard pawns = board.pawns() & side_pieces;
+  const BitBoard knights = board.knights() & side_pieces;
+  const BitBoard bishops = board.bishops() & side_pieces;
+  const BitBoard rooks = board.rooks() & side_pieces;
+  const BitBoard queens = board.queens() & side_pieces;
+  const BitBoard kings = board.kings() & side_pieces;
+
+  const int pawn_dir = side_is_ours ? 1 : -1;
+  for (auto square : pawns) {
+    const int file = square.file().idx;
+    const int rank = square.rank().idx + pawn_dir;
+    if (!IsOnBoard(file, rank)) continue;
+    if (file > 0) {
+      AddAttack(counts, Square(File::FromIdx(file - 1), Rank::FromIdx(rank)));
+    }
+    if (file < 7) {
+      AddAttack(counts, Square(File::FromIdx(file + 1), Rank::FromIdx(rank)));
+    }
+  }
+
+  static constexpr std::array<std::pair<int, int>, 8> kKnightDeltas = {
+      std::pair<int, int>{-2, -1},
+      {-2, 1},
+      {-1, -2},
+      {-1, 2},
+      {1, -2},
+      {1, 2},
+      {2, -1},
+      {2, 1}};
+  for (auto square : knights) {
+    const int file = square.file().idx;
+    const int rank = square.rank().idx;
+    for (const auto& [df, dr] : kKnightDeltas) {
+      const int f = file + df;
+      const int r = rank + dr;
+      if (!IsOnBoard(f, r)) continue;
+      AddAttack(counts, Square(File::FromIdx(f), Rank::FromIdx(r)));
+    }
+  }
+
+  static constexpr std::array<std::pair<int, int>, 8> kKingDeltas = {
+      std::pair<int, int>{-1, -1},
+      {-1, 0},
+      {-1, 1},
+      {0, -1},
+      {0, 1},
+      {1, -1},
+      {1, 0},
+      {1, 1}};
+  for (auto square : kings) {
+    const int file = square.file().idx;
+    const int rank = square.rank().idx;
+    for (const auto& [df, dr] : kKingDeltas) {
+      const int f = file + df;
+      const int r = rank + dr;
+      if (!IsOnBoard(f, r)) continue;
+      AddAttack(counts, Square(File::FromIdx(f), Rank::FromIdx(r)));
+    }
+  }
+
+  static constexpr std::array<std::pair<int, int>, 4> kBishopDirs = {
+      std::pair<int, int>{1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
+  static constexpr std::array<std::pair<int, int>, 4> kRookDirs = {
+      std::pair<int, int>{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+  static constexpr std::array<std::pair<int, int>, 8> kQueenDirs = {
+      std::pair<int, int>{1, 0},
+      {-1, 0},
+      {0, 1},
+      {0, -1},
+      {1, 1},
+      {1, -1},
+      {-1, 1},
+      {-1, -1}};
+
+  for (auto square : bishops) {
+    AddSlidingAttacks(counts, square, kBishopDirs, occupancy);
+  }
+  for (auto square : rooks) {
+    AddSlidingAttacks(counts, square, kRookDirs, occupancy);
+  }
+  for (auto square : queens) {
+    AddSlidingAttacks(counts, square, kQueenDirs, occupancy);
+  }
+
+  return counts;
+}
+
+bool IsPassedPawn(const BitBoard& enemy_pawns, Square pawn, bool pawn_is_ours) {
+  const int pawn_file = pawn.file().idx;
+  const int pawn_rank = pawn.rank().idx;
+  for (auto enemy : enemy_pawns) {
+    const int enemy_file = enemy.file().idx;
+    if (std::abs(enemy_file - pawn_file) > 1) continue;
+    const int enemy_rank = enemy.rank().idx;
+    if (pawn_is_ours && enemy_rank > pawn_rank) return false;
+    if (!pawn_is_ours && enemy_rank < pawn_rank) return false;
+  }
+  return true;
+}
+
+bool IsSquareAttackedByUs(const ChessBoard& board, Square square,
+                          bool black_to_move) {
+  ChessBoard mirrored = board;
+  Square mirrored_square = square;
+  if (!black_to_move) {
+    mirrored.Mirror();
+  }
+  mirrored_square.Flip();
+  return mirrored.IsUnderAttack(mirrored_square);
+}
+
+BitBoard OurDiscoveredChecks(const ChessBoard& board) {
+  const Square enemy_king = SingleSquare(board.kings() & board.theirs());
+  const BitBoard occupied = board.ours() | board.theirs();
+  BitBoard result(0);
+
+  static constexpr std::array<std::pair<int, int>, 8> kDirections = {
+      std::pair<int, int>{1, 0}, {0, 1},  {-1, 0}, {0, -1},
+      std::pair<int, int>{1, 1}, {-1, 1}, {1, -1}, {-1, -1}};
+
+  for (const auto& [df, dr] : kDirections) {
+    int f = enemy_king.file().idx + df;
+    int r = enemy_king.rank().idx + dr;
+    while (IsOnBoard(f, r)) {
+      Square sq(File::FromIdx(f), Rank::FromIdx(r));
+      if (occupied.get(sq)) {
+        if (!board.ours().get(sq)) break;
+        Square blocker = sq;
+        f += df;
+        r += dr;
+        while (IsOnBoard(f, r)) {
+          Square next_sq(File::FromIdx(f), Rank::FromIdx(r));
+          if (occupied.get(next_sq)) {
+            if (board.ours().get(next_sq)) {
+              const bool is_orth = df == 0 || dr == 0;
+              const bool is_diag = std::abs(df) == std::abs(dr);
+              const bool is_rook_like =
+                  board.rooks().get(next_sq) || board.queens().get(next_sq);
+              const bool is_bishop_like =
+                  board.bishops().get(next_sq) || board.queens().get(next_sq);
+              if ((is_orth && is_rook_like) || (is_diag && is_bishop_like)) {
+                // TODO: Identify if pawn can capture, if so, then identify it.
+                // If Ray is Vertical and Blocker is a Pawn, it can't step aside
+                // (ignoring captures)
+                if (df == 0 && board.pawns().get(blocker)) {
+                  break;  // Don't mark result
+                }
+                result.set(blocker);
+              }
+            }
+            break;
+          }
+          f += df;
+          r += dr;
+        }
+        break;
+      }
+      f += df;
+      r += dr;
+    }
+  }
+
+  return result;
+}
+
+struct PieceAtSquare {
+  PieceType type;
+  bool is_ours;
+  bool is_valid;
+};
+
+// Local static-exchange-evaluation (SEE), restored from the pre-5aea63a
+// in-csrc implementation. The pinned libs/lc0 submodule commit does not
+// contain the (uncommitted) ChessBoard::StaticExchangeEvaluation /
+// ComputeTacticalInfo patch that later revisions of this file relied on.
+constexpr int kSeePawnValue = 208;
+constexpr int kSeeKnightValue = 781;
+constexpr int kSeeBishopValue = 825;
+constexpr int kSeeRookValue = 1276;
+constexpr int kSeeQueenValue = 2538;
+constexpr int kSeeKingValue = 0;
+
+inline int SeePieceValue(PieceType type) {
+  switch (type.idx) {
+    case kPawn.idx:
+      return kSeePawnValue;
+    case kKnight.idx:
+      return kSeeKnightValue;
+    case kBishop.idx:
+      return kSeeBishopValue;
+    case kRook.idx:
+      return kSeeRookValue;
+    case kQueen.idx:
+      return kSeeQueenValue;
+    default:
+      return kSeeKingValue;
+  }
+}
+
+PieceAtSquare GetPieceAt(const ChessBoard& board, Square square) {
+  const bool is_ours = board.ours().get(square);
+  const bool is_theirs = board.theirs().get(square);
+  if (!is_ours && !is_theirs) return {PieceType::FromIdx(6), false, false};
+  if (board.pawns().get(square)) return {kPawn, is_ours, true};
+  if (board.knights().get(square)) return {kKnight, is_ours, true};
+  if (board.kings().get(square)) return {kKing, is_ours, true};
+  if (board.queens().get(square)) return {kQueen, is_ours, true};
+  if (board.rooks().get(square)) return {kRook, is_ours, true};
+  if (board.bishops().get(square)) return {kBishop, is_ours, true};
+  return {PieceType::FromIdx(6), false, false};
+}
+
+BitBoard AttackersToSide(const ChessBoard& board, Square target,
+                         const BitBoard& occupied, bool side_is_ours) {
+  const BitBoard side_pieces =
+      (side_is_ours ? board.ours() : board.theirs()) & occupied;
+  const BitBoard pawns = board.pawns() & side_pieces;
+  const BitBoard knights = board.knights() & side_pieces;
+  const BitBoard bishops = board.bishops() & side_pieces;
+  const BitBoard rooks = board.rooks() & side_pieces;
+  const BitBoard queens = board.queens() & side_pieces;
+  const BitBoard kings = board.kings() & side_pieces;
+
+  BitBoard attackers(0);
+
+  const int target_file = target.file().idx;
+  const int target_rank = target.rank().idx;
+  const int pawn_rank = target_rank + (side_is_ours ? -1 : 1);
+  if (IsOnBoard(target_file - 1, pawn_rank)) {
+    Square from(File::FromIdx(target_file - 1), Rank::FromIdx(pawn_rank));
+    if (pawns.get(from)) attackers.set(from);
+  }
+  if (IsOnBoard(target_file + 1, pawn_rank)) {
+    Square from(File::FromIdx(target_file + 1), Rank::FromIdx(pawn_rank));
+    if (pawns.get(from)) attackers.set(from);
+  }
+
+  static constexpr std::array<std::pair<int, int>, 8> kKnightDeltas = {
+      std::pair<int, int>{-2, -1},
+      {-2, 1},
+      {-1, -2},
+      {-1, 2},
+      {1, -2},
+      {1, 2},
+      {2, -1},
+      {2, 1}};
+  for (const auto& [df, dr] : kKnightDeltas) {
+    const int f = target_file + df;
+    const int r = target_rank + dr;
+    if (!IsOnBoard(f, r)) continue;
+    Square from(File::FromIdx(f), Rank::FromIdx(r));
+    if (knights.get(from)) attackers.set(from);
+  }
+
+  static constexpr std::array<std::pair<int, int>, 8> kKingDeltas = {
+      std::pair<int, int>{-1, -1},
+      {-1, 0},
+      {-1, 1},
+      {0, -1},
+      {0, 1},
+      {1, -1},
+      {1, 0},
+      {1, 1}};
+  for (const auto& [df, dr] : kKingDeltas) {
+    const int f = target_file + df;
+    const int r = target_rank + dr;
+    if (!IsOnBoard(f, r)) continue;
+    Square from(File::FromIdx(f), Rank::FromIdx(r));
+    if (kings.get(from)) attackers.set(from);
+  }
+
+  static constexpr std::array<std::pair<int, int>, 4> kBishopDirs = {
+      std::pair<int, int>{1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
+  static constexpr std::array<std::pair<int, int>, 4> kRookDirs = {
+      std::pair<int, int>{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+
+  for (const auto& [df, dr] : kBishopDirs) {
+    int f = target_file + df;
+    int r = target_rank + dr;
+    while (IsOnBoard(f, r)) {
+      Square from(File::FromIdx(f), Rank::FromIdx(r));
+      if (occupied.get(from)) {
+        if (bishops.get(from) || queens.get(from)) attackers.set(from);
+        break;
+      }
+      f += df;
+      r += dr;
+    }
+  }
+  for (const auto& [df, dr] : kRookDirs) {
+    int f = target_file + df;
+    int r = target_rank + dr;
+    while (IsOnBoard(f, r)) {
+      Square from(File::FromIdx(f), Rank::FromIdx(r));
+      if (occupied.get(from)) {
+        if (rooks.get(from) || queens.get(from)) attackers.set(from);
+        break;
+      }
+      f += df;
+      r += dr;
+    }
+  }
+
+  return attackers;
+}
+
+Square LeastValuableAttackerSquare(const ChessBoard& board, Square target,
+                                   const BitBoard& occupied,
+                                   bool side_is_ours) {
+  const BitBoard side_pieces =
+      (side_is_ours ? board.ours() : board.theirs()) & occupied;
+  const BitBoard pawns = board.pawns() & side_pieces;
+  const BitBoard knights = board.knights() & side_pieces;
+  const BitBoard bishops = board.bishops() & side_pieces;
+  const BitBoard rooks = board.rooks() & side_pieces;
+  const BitBoard queens = board.queens() & side_pieces;
+  const BitBoard kings = board.kings() & side_pieces;
+
+  const BitBoard attackers =
+      AttackersToSide(board, target, occupied, side_is_ours) & side_pieces;
+
+  for (auto square : (attackers & pawns)) return square;
+  for (auto square : (attackers & knights)) return square;
+  for (auto square : (attackers & bishops)) return square;
+  for (auto square : (attackers & rooks)) return square;
+  for (auto square : (attackers & queens)) return square;
+  for (auto square : (attackers & kings)) return square;
+  assert(false);
+  return Square();
+}
+
+int SeeValue(const ChessBoard& board, Move move) {
+  const Square from = move.from();
+  const Square to = move.to();
+
+  int captured_value = 0;
+  if (move.is_en_passant()) {
+    captured_value = SeePieceValue(kPawn);
+  } else {
+    const PieceAtSquare captured = GetPieceAt(board, to);
+    if (!captured.is_valid) return 0;
+    captured_value = SeePieceValue(captured.type);
+  }
+
+  std::array<int, 32> gain{};
+  int depth = 0;
+  gain[0] = captured_value;
+
+  BitBoard occupied = board.ours() | board.theirs();
+  occupied.reset(from);
+  occupied.reset(to);
+  if (move.is_en_passant()) {
+    occupied.reset(Square(to.file(), kRank5));
+  }
+
+  bool side_is_ours = false;
+  while (true) {
+    side_is_ours = !side_is_ours;
+    const BitBoard attackers =
+        AttackersToSide(board, to, occupied, side_is_ours) &
+        (side_is_ours ? board.ours() : board.theirs()) & occupied;
+    if (attackers.empty()) break;
+
+    const Square attacker =
+        LeastValuableAttackerSquare(board, to, occupied, side_is_ours);
+    const PieceAtSquare attacker_piece = GetPieceAt(board, attacker);
+    const int attacker_value =
+        attacker_piece.is_valid ? SeePieceValue(attacker_piece.type) : 0;
+    gain[++depth] = attacker_value - gain[depth - 1];
+    if (std::max(-gain[depth - 1], gain[depth]) < 0) break;
+    occupied.reset(attacker);
+    if (depth + 1 >= static_cast<int>(gain.size())) break;
+  }
+
+  while (--depth) {
+    gain[depth - 1] = -std::max(-gain[depth - 1], gain[depth]);
+  }
+  return gain[0];
+}
+
+}  // namespace
 
 Dn1Planes ComputeDn1Planes(const FrameType& frame) {
   const auto input_format =
@@ -44,22 +480,94 @@ Dn1Planes ComputeDn1Planes(const FrameType& frame) {
   int gameply = 0;
   PopulateBoard(input_format, planes, &board, &rule50, &gameply);
 
-  TacticalInfo tactical = board.ComputeTacticalInfo();
+  const bool black_to_move =
+      !IsCanonicalFormat(input_format) && frame.side_to_move_or_enpassant != 0;
+
+  const BitBoard our_pieces = board.ours();
+  const BitBoard their_pieces = board.theirs();
+  // const BitBoard our_king = board.kings() & our_pieces;
+  // const BitBoard their_king = board.kings() & their_pieces;
 
   Dn1Planes out;
-  out.our_pins = tactical.our_pins;
-  out.their_pins = tactical.their_pins;
-  out.our_discovered_checks = tactical.our_discovered_checks;
-  out.our_passed_pawns = tactical.our_passed_pawns;
-  out.their_passed_pawns = tactical.their_passed_pawns;
-  out.our_hanging = tactical.our_hanging;
-  out.control_plus = tactical.control_plus;
-  out.control_equal = tactical.control_equal;
-  out.control_minus = tactical.control_minus;
-  out.see_positive = tactical.see_positive;
-  out.see_equal = tactical.see_equal;
-  out.see_negative = tactical.see_negative;
-  out.legal_checks = tactical.legal_checks;
+
+  out.our_pins = board.GenerateKingAttackInfo().pinned_pieces_;
+
+  {
+    ChessBoard mirrored = board;
+    mirrored.Mirror();
+    out.their_pins = mirrored.GenerateKingAttackInfo().pinned_pieces_;
+    out.their_pins.Mirror();
+  }
+
+  out.our_discovered_checks = OurDiscoveredChecks(board);
+
+  const BitBoard our_pawns = board.pawns() & our_pieces;
+  const BitBoard their_pawns = board.pawns() & their_pieces;
+  for (auto square : our_pawns) {
+    if (IsPassedPawn(their_pawns, square, true)) {
+      out.our_passed_pawns.set(square);
+    }
+  }
+  for (auto square : their_pawns) {
+    if (IsPassedPawn(our_pawns, square, false)) {
+      out.their_passed_pawns.set(square);
+    }
+  }
+
+  const auto our_attacks = ComputeAttackCounts(board, our_pieces, true);
+  const auto their_attacks = ComputeAttackCounts(board, their_pieces, false);
+
+  for (auto square : our_pieces) {
+    const int idx = square.as_idx();
+    const int our_count = our_attacks[idx];
+    const int their_count = their_attacks[idx];
+    if (our_count == 0 && their_count > 0) {
+      out.our_hanging.set(square);
+    }
+  }
+
+  for (auto square : (our_pieces | their_pieces)) {
+    const int idx = square.as_idx();
+    const int our_count = our_attacks[idx];
+    const int their_count = their_attacks[idx];
+
+    if (their_count == 0 || our_count == 0) continue;
+    if (our_count > their_count) {
+      out.control_plus.set(square);
+    } else if (our_count == their_count) {
+      out.control_equal.set(square);
+    } else {
+      out.control_minus.set(square);
+    }
+  }
+
+  const MoveList legal_moves = board.GenerateLegalMoves();
+  for (const auto& move : legal_moves) {
+    Square dest = move.to();
+
+    ChessBoard copy = board;
+    bool isZeroing = copy.ApplyMove(move);
+    copy.Mirror();
+
+    if (copy.IsUnderCheck()) {
+      out.legal_checks.set(dest);
+    }
+
+    const bool is_capture = move.is_en_passant() || their_pieces.get(dest);
+    if (!is_capture) continue;
+
+    // This is a very expensive operation, a simplified approximation might
+    // be needed.
+    const int see_value = SeeValue(board, move);
+    if (see_value >= kSeeThreshold) {
+      out.see_positive.set(dest);
+    } else if (see_value < kSeeThreshold && see_value >= 0) {
+      out.see_equal.set(dest);
+    } else if (see_value < 0) {
+      out.see_negative.set(dest);
+    }
+  }
+
   return out;
 }
 
