@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional, Sequence, Tuple, Union, cast
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, cast
 
 import jax
 import jax.numpy as jnp
@@ -37,6 +37,51 @@ def _compute_q_from_wdl(wdl_logits: jax.Array) -> jax.Array:
     wdl_probs = jax.nn.softmax(wdl_logits)
     q_weights = jnp.array([1.0, 0.0, -1.0])
     return jnp.dot(wdl_probs, q_weights)
+
+
+def _positive_temperature_or_one(temperature: float) -> float:
+    return temperature if temperature > 0 else 1.0
+
+
+def _softmax_distillation_loss(
+    student_logits: jax.Array,
+    teacher_logits: jax.Array,
+    temperature: float,
+    mask: Optional[jax.Array] = None,
+) -> jax.Array:
+    teacher_probs = jax.nn.softmax(teacher_logits / temperature)
+
+    if mask is not None:
+        student_logits = jnp.where(mask, student_logits, MASKED_POLICY_LOGIT)
+        teacher_probs = jnp.where(mask, teacher_probs, 0.0)
+        teacher_probs_sum = jnp.sum(teacher_probs, axis=-1, keepdims=True)
+        safe_sum = jnp.where(
+            teacher_probs_sum > 0,
+            teacher_probs_sum,
+            jnp.ones_like(teacher_probs_sum),
+        )
+        teacher_probs = teacher_probs / safe_sum
+
+    teacher_probs = jax.lax.stop_gradient(teacher_probs)
+    kd_loss = optax.softmax_cross_entropy(
+        logits=student_logits / temperature,
+        labels=teacher_probs,
+    )
+    return kd_loss * (temperature * temperature)
+
+
+def _teacher_kd_params(
+    global_kd_alpha: float,
+    global_temperature: float,
+    head_config: Optional[Any],
+) -> Tuple[float, float]:
+    kd_alpha = global_kd_alpha
+    temperature = global_temperature
+    if head_config is not None:
+        kd_alpha = head_config.kd_alpha
+        if head_config.temperature > 0:
+            temperature = head_config.temperature
+    return kd_alpha, temperature
 
 
 class LossBase:
@@ -168,10 +213,43 @@ class LczeroLoss:
             self._loss_weights[f"regularization/{reg_loss.metric_name}"] = (
                 reg_loss.weight
             )
+        if self.teacher_config is not None:
+            self._register_teacher_loss_weights()
 
     @property
     def loss_weights(self) -> Dict[str, float]:
         return dict(self._loss_weights)
+
+    def _register_teacher_loss_weights(self) -> None:
+        assert self.teacher_config is not None
+        self._register_teacher_head_loss_weights(
+            "policy",
+            list(self.teacher_config.model.policy_head)
+            + list(self.teacher_config.model.simple_policy_head),
+            self.teacher_config.policy,
+        )
+        self._register_teacher_head_loss_weights(
+            "value",
+            list(self.teacher_config.model.value_head)
+            + list(self.teacher_config.model.simple_value_head),
+            self.teacher_config.value,
+        )
+
+    def _register_teacher_head_loss_weights(
+        self,
+        family: str,
+        head_configs: Sequence[Any],
+        overrides: Sequence[Any],
+    ) -> None:
+        assert self.teacher_config is not None
+        override_by_name = {config.head_name: config for config in overrides}
+        for head_config in head_configs:
+            if not head_config.name:
+                continue
+            kd_alpha = self.teacher_config.kd_alpha
+            if head_config.name in override_by_name:
+                kd_alpha = override_by_name[head_config.name].kd_alpha
+            self._loss_weights[f"kd/{family}/{head_config.name}"] = kd_alpha
 
     def weighted_losses(
         self, unweighted_losses: Dict[str, jax.Array]
@@ -278,60 +356,58 @@ class LczeroLoss:
         if teacher_model is not None and self.teacher_config is not None:
             teacher_predictions = teacher_model(sample.inputs)
             global_kd_alpha = self.teacher_config.kd_alpha
-            global_temp = self.teacher_config.temperature or 1.0
+            global_temp = _positive_temperature_or_one(
+                self.teacher_config.temperature
+            )
 
-            # Map head_name -> TeacherPolicyConfig
             policy_map = {p.head_name: p for p in self.teacher_config.policy}
+            value_map = {v.head_name: v for v in self.teacher_config.value}
 
             for head_name, student_logits in predictions.policy.items():
                 if head_name in teacher_predictions.policy:
-                    # Determine parameters for this head.
-                    kd_alpha = global_kd_alpha
-                    temp = global_temp
-
-                    if head_name in policy_map:
-                        cfg = policy_map[head_name]
-                        kd_alpha = cfg.kd_alpha
-                        if cfg.temperature > 0:
-                            temp = cfg.temperature
+                    kd_alpha, temp = _teacher_kd_params(
+                        global_kd_alpha,
+                        global_temp,
+                        policy_map.get(head_name),
+                    )
 
                     if kd_alpha == 0:
                         continue
 
                     teacher_logits = teacher_predictions.policy[head_name]
 
-                    # KL divergence for distillation
-                    # T^2 * KL(softmax(teacher_logits/T),
-                    # softmax(student_logits/T))
-                    teacher_probs = jax.nn.softmax(teacher_logits / temp)
-                    teacher_probs = jax.lax.stop_gradient(teacher_probs)
-
                     policy_targets = jnp.asarray(
                         sample.probabilities, dtype=student_logits.dtype
                     )
-                    legal_mask = policy_targets >= 0
-                    student_logits = jnp.where(
-                        legal_mask, student_logits, -1.0e10
+                    kd_loss = _softmax_distillation_loss(
+                        student_logits,
+                        teacher_logits,
+                        temp,
+                        mask=policy_targets >= 0,
                     )
-                    teacher_probs = jnp.where(legal_mask, teacher_probs, 0.0)
-                    teacher_probs_sum = jnp.sum(
-                        teacher_probs, axis=-1, keepdims=True
-                    )
-                    safe_sum = jnp.where(
-                        teacher_probs_sum > 0,
-                        teacher_probs_sum,
-                        jnp.ones_like(teacher_probs_sum),
-                    )
-                    teacher_probs = teacher_probs / safe_sum
-
-                    kd_loss = optax.softmax_cross_entropy(
-                        logits=student_logits / temp, labels=teacher_probs
-                    )
-
-                    # Scale by T^2 as per Hinton's distillation paper
-                    kd_loss = kd_loss * (temp * temp)
 
                     unweighted_losses[f"kd/policy/{head_name}"] = kd_loss
+                    weighted_losses.append(kd_loss * kd_alpha)
+
+            for head_name, student_value in predictions.value.items():
+                if head_name in teacher_predictions.value:
+                    kd_alpha, temp = _teacher_kd_params(
+                        global_kd_alpha,
+                        global_temp,
+                        value_map.get(head_name),
+                    )
+
+                    if kd_alpha == 0:
+                        continue
+
+                    teacher_value = teacher_predictions.value[head_name]
+                    kd_loss = _softmax_distillation_loss(
+                        student_value[0],
+                        teacher_value[0],
+                        temp,
+                    )
+
+                    unweighted_losses[f"kd/value/{head_name}"] = kd_loss
                     weighted_losses.append(kd_loss * kd_alpha)
 
         data_loss = jnp.sum(jnp.array(weighted_losses))
