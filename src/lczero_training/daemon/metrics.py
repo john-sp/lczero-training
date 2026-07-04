@@ -27,6 +27,21 @@ logger = logging.getLogger(__name__)
 BatchTuple = tuple[np.ndarray, ...]
 
 
+def _batch_sample_from_tuple(batch: BatchTuple) -> TrainingSample:
+    """Build a batched TrainingSample from a DataLoader tuple.
+
+    Accepts the 5-tensor tuple (inputs, probabilities, values, aux_indices,
+    aux_targets) as well as legacy 3-tensor tuples (aux tensors then None).
+    """
+    return TrainingSample(
+        inputs=jnp.asarray(batch[0]),
+        probabilities=jnp.asarray(batch[1]),
+        values=jnp.asarray(batch[2]),
+        aux_indices=jnp.asarray(batch[3]) if len(batch) > 3 else None,
+        aux_targets=jnp.asarray(batch[4]) if len(batch) > 4 else None,
+    )
+
+
 @dataclass
 class CachedBatch:
     """Cached batch data with the global step when it was last updated."""
@@ -107,11 +122,7 @@ class _EvaluatingMetric(_Metric, ABC):
         )
         if model_state is None:
             raise RuntimeError("SWA state not available")
-        batch_sample = TrainingSample(
-            inputs=jnp.asarray(batch[0]),
-            probabilities=jnp.asarray(batch[1]),
-            values=jnp.asarray(batch[2]),
-        )
+        batch_sample = _batch_sample_from_tuple(batch)
         return _make_eval_jit(graphdef, self.loss_fn)(model_state, batch_sample)
 
 
@@ -165,11 +176,7 @@ def evaluate_batch(
     )
     if model_state is None:
         raise RuntimeError("SWA state not available")
-    batch_sample = TrainingSample(
-        inputs=jnp.asarray(batch[0]),
-        probabilities=jnp.asarray(batch[1]),
-        values=jnp.asarray(batch[2]),
-    )
+    batch_sample = _batch_sample_from_tuple(batch)
     return _make_eval_jit(graphdef, loss_fn)(model_state, batch_sample)
 
 

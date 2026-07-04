@@ -38,12 +38,9 @@ def _stop_loader(loader: DataLoader) -> None:
 
 
 def _prepare_batch(batch_tuple: tuple) -> TrainingBatch:
-    # DataLoader now returns tuple: (inputs, probabilities, values)
-    return TrainingBatch(
-        inputs=jnp.asarray(batch_tuple[0]),
-        probabilities=jnp.asarray(batch_tuple[1]),
-        values=jnp.asarray(batch_tuple[2]),
-    )
+    # DataLoader returns tuple: (inputs, probabilities, values,
+    # aux_indices, aux_targets).
+    return TrainingBatch.from_tuple(batch_tuple)
 
 
 def _make_eval_step(
@@ -75,7 +72,9 @@ def _make_eval_step(
         # vmap automatically distributes TrainingBatch over batch dimension,
         # calling loss_for_batch with TrainingSample (single samples).
         per_sample_loss, unweighted_losses = loss_vfn(
-            model, batch, teacher_model  # type: ignore[arg-type]
+            model,
+            batch,
+            teacher_model,  # type: ignore[arg-type]
         )
         mean_loss = jnp.mean(per_sample_loss)
         mean_unweighted = tree_util.tree_map(jnp.mean, unweighted_losses)
@@ -172,7 +171,9 @@ def overfit(
     loss_fn = LczeroLoss(
         config=config.training.losses,
         teacher_config=(
-            config.training.teacher if config.training.HasField("teacher") else None
+            config.training.teacher
+            if config.training.HasField("teacher")
+            else None
         ),
     )
     training = Training(

@@ -157,6 +157,8 @@ message LossConfig {
   repeated ValueErrorLossConfig value_error = 4;
   repeated ValueCategoricalLossConfig value_categorical = 5;
   repeated RegularizationLossConfig regularization = 6;
+  repeated PolicyIndexLossConfig policy_index = 7;
+  repeated ChildQLossConfig child_q = 8;
 }
 
 message RegularizationLossConfig {
@@ -177,6 +179,9 @@ enum ValueType {
   ORIG = 3;
   ROOT = 4;
   ST = 5;
+  // Blunder-censored short-term value (V7 reserved[1]/reserved[2]).
+  // Falls back to plain ST values for chunks upgraded from V6 in-loop.
+  ST_CENSORED = 6;
 }
 
 message OptimisticPolicyConfig {
@@ -221,6 +226,35 @@ message ValueLossConfig {
   string metric_name = 2;
   float weight = 3;
   ValueType value_type = 4;
+  // Optional per-sample weighting by provenance class (aux_targets column 0).
+  // When present, must contain exactly 4 entries, indexed by provenance:
+  // [0]=none, [1]=tablebase, [2]=noise-deblunder, [3]=unintended-deblunder.
+  repeated float provenance_weights = 5;
+}
+
+// Cross-entropy loss of a policy-shaped head (1858 logits) against a single
+// move index target from the aux_indices tensor. Samples where the index is
+// 65535 (no such move, e.g. near the end of the game) are masked out.
+message PolicyIndexLossConfig {
+  string head_name = 1;
+  string metric_name = 2;
+  float weight = 3;
+  enum Target {
+    // Move played by the opponent one ply ahead (aux_indices column 0).
+    OPP_PLAYED = 0;
+    // Our move played two plies ahead (aux_indices column 1).
+    NEXT_PLAYED = 1;
+  }
+  Target target = 4;
+}
+
+// MSE loss between the named policy-shaped head's output at the played-move
+// index (aux_indices column 2) and the played-move child-Q target
+// (aux_targets column 1). Samples with NaN child-Q are masked out.
+message ChildQLossConfig {
+  string head_name = 1;
+  string metric_name = 2;
+  float weight = 3;
 }
 
 message MovesLeftLossConfig {

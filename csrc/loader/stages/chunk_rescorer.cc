@@ -1,5 +1,6 @@
 #include "loader/stages/chunk_rescorer.h"
 
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -46,6 +47,22 @@ void V6ToV7(std::span<FrameType> data, float theta = 5.0f / 6.0f) {
     };
     item.opp_played_idx = get_idx(1);
     item.next_played_idx = get_idx(2);
+
+    // Fill the reserved block for frames upgraded from V6. Genuine V7
+    // input never reaches this function (gated on version == 6), so the
+    // offline rescorer's values are never overwritten.
+    // reserved[0]: provenance (0 = none).
+    // reserved[1]/[2]: blunder-censored short-term value; without censoring
+    // information, fall back to the plain short-term values.
+    // reserved[3]: played-move child-Q (NaN = not available).
+    item.reserved[0] = 0.0f;
+    item.reserved[1] = item.q_st;
+    item.reserved[2] = item.d_st;
+    item.reserved[3] = std::numeric_limits<float>::quiet_NaN();
+    item.reserved[4] = 0.0f;
+    item.reserved[5] = 0.0f;
+    item.reserved[6] = 0.0f;
+    item.reserved[7] = 0.0f;
   }
 }
 

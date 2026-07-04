@@ -287,6 +287,13 @@ class Training:
                 f"value_categorical/{loss.metric_name}"
                 for loss in loss_fn.value_categorical_losses
             )
+            + list(
+                f"policy_index/{loss.metric_name}"
+                for loss in loss_fn.policy_index_losses
+            )
+            + list(
+                f"child_q/{loss.metric_name}" for loss in loss_fn.child_q_losses
+            )
         )
         self._primary_component_keys: tuple[str, ...] = tuple(
             key
@@ -331,6 +338,8 @@ class Training:
                 inputs=dp_sharding,
                 probabilities=dp_sharding,
                 values=dp_sharding,
+                aux_indices=dp_sharding,
+                aux_targets=dp_sharding,
             )
             # jit_state, batch, teacher_model_state
             # (optimizer_tx is static, so excluded from in_shardings.)
@@ -913,9 +922,8 @@ class Training:
         if not logger.isEnabledFor(logging.INFO):
             return
         should_log = (
-            (local_step + 1) % STEP_LOG_PERIOD == 0
-            or local_step + 1 == num_steps
-        )
+            local_step + 1
+        ) % STEP_LOG_PERIOD == 0 or local_step + 1 == num_steps
         if not should_log:
             return
         loss = float(metrics["loss"])
