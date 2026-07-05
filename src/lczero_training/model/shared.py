@@ -10,6 +10,10 @@ from .utils import get_activation
 
 ActivationSink = Callable[[str, jax.Array], None]
 
+# ACTIVATION_SWIGLU only exists in an extended net.proto; None when this
+# net.proto predates it (no net parsed with it can use SwiGLU then).
+_ACTIVATION_SWIGLU = getattr(net_pb2.NetworkFormat, "ACTIVATION_SWIGLU", None)
+
 
 class Ffn(nnx.Module):
     def __init__(
@@ -35,7 +39,7 @@ class Ffn(nnx.Module):
         )
         self.activation = hidden_activation
         self.linear_gate: nnx.Linear | None
-        if self.activation == net_pb2.NetworkFormat.ACTIVATION_SWIGLU:
+        if self.activation == _ACTIVATION_SWIGLU:
             self.linear_gate = nnx.Linear(
                 in_features=in_features,
                 out_features=hidden_features,
@@ -62,7 +66,7 @@ class Ffn(nnx.Module):
             activation_sink(
                 f"encoders/layers/{layer_index}/ffn/linear1/kernel", x
             )
-        if self.activation == net_pb2.NetworkFormat.ACTIVATION_SWIGLU:
+        if self.activation == _ACTIVATION_SWIGLU:
             assert self.linear_gate is not None
             gate = nnx.sigmoid(self.linear_gate(x))
             hidden = self.linear1(x)
