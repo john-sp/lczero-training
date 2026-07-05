@@ -148,9 +148,14 @@ void ChunkRescorer::Worker(std::stop_token stop_token, ThreadContext* context) {
       }();
 
       try {
-        chunk.frames = RescoreTrainingData<FrameType>(
-            chunk.frames, &tablebase_, dist_temp_, dist_offset_, dtz_boost_,
-            new_input_format_);
+        // Skip rescoring when no tablebase is available: RescoreTrainingData
+        // probes Syzygy unconditionally for low-piece positions and
+        // dereferences a null table (segfault) if initialization failed.
+        if (tablebase_initialized_) {
+          chunk.frames = RescoreTrainingData<FrameType>(
+              chunk.frames, &tablebase_, dist_temp_, dist_offset_, dtz_boost_,
+              new_input_format_);
+        }
         if (chunk.frames.at(0).version == 6) V6ToV7(chunk.frames, st_q_theta_);
         LoadMetricPauser pauser(context->load_metric_updater);
         producer.Put(std::move(chunk), stop_token);
