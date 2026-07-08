@@ -235,7 +235,7 @@ ShufflingChunkPool::InitializeChunkSources() {
     }
 
     LOG_EVERY_N_SEC(INFO, 4) << "Loaded so far: " << total_chunks.load()
-                             << "; new: " << chunks_since_anchor_;
+                             << "; new: " << chunks_since_anchor_.load();
     ++sources_to_keep;
   }
 
@@ -331,7 +331,7 @@ void ShufflingChunkPool::ProcessInputFiles(
     }
 
     LOG(INFO) << sources_after_anchor.size()
-              << " chunk source(s) after anchor, " << chunks_since_anchor_
+              << " chunk source(s) after anchor, " << chunks_since_anchor_.load()
               << " total chunks since anchor";
 
     const size_t to_log = std::min(sources_after_anchor.size(), size_t(20));
