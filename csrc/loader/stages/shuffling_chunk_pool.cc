@@ -235,7 +235,7 @@ ShufflingChunkPool::InitializeChunkSources() {
     }
 
     LOG_EVERY_N_SEC(INFO, 4) << "Loaded so far: " << total_chunks.load()
-                             << "; new: " << chunks_since_anchor_;
+                             << "; new: " << chunks_since_anchor_.load();
     ++sources_to_keep;
   }
 
@@ -246,6 +246,28 @@ ShufflingChunkPool::InitializeChunkSources() {
   if (total_chunks < chunk_pool_size_ && !output_queue()->IsClosed()) {
     LOG(ERROR) << "ShufflingChunkPool startup chunk requirement not met: "
                << total_chunks.load() << " < " << chunk_pool_size_;
+  }
+
+  // If chunk_pool_size_ was reached before all candidate sources were consumed,
+  // the remaining (older) sources are dropped and NEVER trained on. This is
+  // intentional for RL streaming (a sliding window over freshly generated
+  // data), but for a static dataset it silently truncates training to a subset
+  // of the corpus. Make the discard loud so it cannot pass unnoticed.
+  const size_t total_candidates = uninitialized_sources.size();
+  if (sources_to_keep < total_candidates) {
+    size_t discarded_chunks = 0;
+    for (size_t i = sources_to_keep; i < total_candidates; ++i) {
+      discarded_chunks += uninitialized_sources[i]->GetChunkCount();
+    }
+    LOG(WARNING)
+        << "ShufflingChunkPool kept only the newest " << sources_to_keep
+        << " of " << total_candidates << " source(s) (" << total_chunks.load()
+        << " chunk(s)) to fill chunk_pool_size=" << chunk_pool_size_
+        << ", DISCARDING the remaining " << (total_candidates - sources_to_keep)
+        << " source(s) (" << discarded_chunks
+        << " chunk(s)) which will NOT be trained on. This is expected for RL "
+           "streaming but truncates a static dataset -- for static datasets "
+           "set chunk_pool_size >= total chunk count.";
   }
 
   // Trim the vector to only keep the sources we need.
@@ -309,7 +331,7 @@ void ShufflingChunkPool::ProcessInputFiles(
     }
 
     LOG(INFO) << sources_after_anchor.size()
-              << " chunk source(s) after anchor, " << chunks_since_anchor_
+              << " chunk source(s) after anchor, " << chunks_since_anchor_.load()
               << " total chunks since anchor";
 
     const size_t to_log = std::min(sources_after_anchor.size(), size_t(20));
@@ -557,7 +579,17 @@ ShufflingChunkPool::ChunkStatus ShufflingChunkPool::GetChunkInfo(
                                ? total_chunks - chunk_pool_size_
                                : chunk_sources_.front()->start_chunk_index;
       stream_shuffler_.Reset(lower_bound, total_chunks);
-      reshuffles_.fetch_add(1, std::memory_order_acq_rel);
+      const uint64_t reshuffle_count =
+          reshuffles_.fetch_add(1, std::memory_order_acq_rel) + 1;
+      // The shuffler exhausted the window and wrapped around to replay the same
+      // chunks. Under a static dataset (no new sources arriving) this repeats
+      // forever, so surface it periodically to make static-window cycling
+      // visible in the logs rather than looking like fresh throughput.
+      LOG_EVERY_N_SEC(WARNING, 600)
+          << "ShufflingChunkPool re-shuffling the same "
+          << (total_chunks - lower_bound) << " chunk(s) (reshuffle #"
+          << reshuffle_count
+          << ") -- no new data has arrived since the last window reset.";
       chunk_index = stream_shuffler_.GetNextItem();
     }
 

@@ -466,12 +466,16 @@ class Evaluation:
         batch_tuple = next(datagen)
         logger.info("Fetched batch from dataloader")
 
-        # DataLoader now returns tuple: (inputs, probabilities, values)
+        # DataLoader returns tuple: (inputs, probabilities, values,
+        # aux_indices, aux_targets).
         batch = {
             "inputs": cast(jax.Array, jnp.asarray(batch_tuple[0])),
             "probabilities": cast(jax.Array, jnp.asarray(batch_tuple[1])),
             "values": cast(jax.Array, jnp.asarray(batch_tuple[2])),
         }
+        if len(batch_tuple) > 4:
+            batch["aux_indices"] = cast(jax.Array, jnp.asarray(batch_tuple[3]))
+            batch["aux_targets"] = cast(jax.Array, jnp.asarray(batch_tuple[4]))
         dumper.dump_tensors(batch, "INPUT")
 
         predictions = model_output_vfn(model, cast(jax.Array, batch["inputs"]))
@@ -512,6 +516,8 @@ class Evaluation:
             inputs=batch["inputs"],
             probabilities=batch["probabilities"],
             values=batch["values"],
+            aux_indices=batch.get("aux_indices"),
+            aux_targets=batch.get("aux_targets"),
         )
         per_sample_loss, unweighted_losses = loss_vfn(model, batch_sample)
         losses = {

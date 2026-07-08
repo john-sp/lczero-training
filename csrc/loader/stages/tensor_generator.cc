@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -97,16 +98,36 @@ void TensorGenerator::Worker(std::stop_token stop_token,
   }
 }
 
+namespace {
+
+// Returns true when the V7 reserved block carries data written by the
+// offline rescorer. Frames upgraded from V6 (in-loop or by struct-widening
+// in the chunk sources) have the whole block zeroed. A NaN in the
+// child-Q slot counts as data (it is a deliberately written sentinel).
+bool HasReservedData(const FrameType& frame) {
+  if (frame.version < 7) return false;
+  for (size_t i = 0; i < 4; ++i) {
+    const float v = frame.reserved[i];
+    if (std::isnan(v) || v != 0.0f) return true;
+  }
+  return false;
+}
+
+}  // namespace
+
 TensorTuple TensorGenerator::ConvertFramesToTensors(
     const std::vector<FrameType>& frames) {
   const size_t batch_size = frames.size();
   constexpr size_t kNumPlanes = 112;
   constexpr size_t kNumPolicyMoves = 1858;
-  constexpr size_t kNumValueTypes = 6;
+  constexpr size_t kNumValueTypes = 7;
   constexpr size_t kValuesPerType = 3;
+  constexpr size_t kNumAuxIndices = 3;
+  constexpr size_t kNumAuxTargets = 2;
+  constexpr int32_t kInvalidMoveIndex = 65535;
 
   TensorTuple result;
-  result.reserve(3);
+  result.reserve(5);
 
   // Index 0: Input planes (batch_size, 112, 8, 8)
   auto planes_tensor = std::make_unique<TypedTensor<float>>(
@@ -124,8 +145,9 @@ TensorTuple TensorGenerator::ConvertFramesToTensors(
   }
   result.push_back(std::move(probs_tensor));
 
-  // Index 2: Values (batch_size, 6, 3) with [q, d, m] for each type.
-  // [0]: result, [1]: best, [2]: played, [3]: orig, [4]: root, [5]: st
+  // Index 2: Values (batch_size, 7, 3) with [q, d, m] for each type.
+  // [0]: result, [1]: best, [2]: played, [3]: orig, [4]: root, [5]: st,
+  // [6]: st_censored
   auto values_tensor =
       std::make_unique<TypedTensor<float>>(std::initializer_list<size_t>{
           batch_size, kNumValueTypes, kValuesPerType});
@@ -168,8 +190,61 @@ TensorTuple TensorGenerator::ConvertFramesToTensors(
     st_slice[0] = frame.q_st;
     st_slice[1] = frame.d_st;
     st_slice[2] = std::numeric_limits<float>::quiet_NaN();
+
+    // Index 6: st_censored [reserved[1], reserved[2], NaN], the
+    // blunder-censored short-term value written by the offline rescorer.
+    // Falls back to plain st values when the reserved block carries no
+    // data (V6 input upgraded in-loop).
+    auto st_censored_slice =
+        batch_slice.subspan(6 * kValuesPerType, kValuesPerType);
+    if (HasReservedData(frame)) {
+      st_censored_slice[0] = frame.reserved[1];
+      st_censored_slice[1] = frame.reserved[2];
+    } else {
+      st_censored_slice[0] = frame.q_st;
+      st_censored_slice[1] = frame.d_st;
+    }
+    st_censored_slice[2] = std::numeric_limits<float>::quiet_NaN();
   }
   result.push_back(std::move(values_tensor));
+
+  // Index 3: Aux move indices (batch_size, 3) int32:
+  // [0]: opp_played_idx, [1]: next_played_idx, [2]: played_idx.
+  // 65535 is the "no such move" sentinel, passed through for masking.
+  auto aux_indices_tensor = std::make_unique<TypedTensor<int32_t>>(
+      std::initializer_list<size_t>{batch_size, kNumAuxIndices});
+  for (size_t i = 0; i < batch_size; ++i) {
+    const auto& frame = frames[i];
+    auto aux_slice = aux_indices_tensor->slice({static_cast<ssize_t>(i)});
+    if (frame.version >= 7) {
+      aux_slice[0] = static_cast<int32_t>(frame.opp_played_idx);
+      aux_slice[1] = static_cast<int32_t>(frame.next_played_idx);
+    } else {
+      aux_slice[0] = kInvalidMoveIndex;
+      aux_slice[1] = kInvalidMoveIndex;
+    }
+    aux_slice[2] = static_cast<int32_t>(frame.played_idx);
+  }
+  result.push_back(std::move(aux_indices_tensor));
+
+  // Index 4: Aux targets (batch_size, 2) float32:
+  // [0]: provenance (reserved[0]: 0 none / 1 tablebase / 2 noise-deblunder
+  //      / 3 unintended-deblunder),
+  // [1]: played-move child-Q (reserved[3], NaN when none).
+  auto aux_targets_tensor = std::make_unique<TypedTensor<float>>(
+      std::initializer_list<size_t>{batch_size, kNumAuxTargets});
+  for (size_t i = 0; i < batch_size; ++i) {
+    const auto& frame = frames[i];
+    auto aux_slice = aux_targets_tensor->slice({static_cast<ssize_t>(i)});
+    if (HasReservedData(frame)) {
+      aux_slice[0] = frame.reserved[0];
+      aux_slice[1] = frame.reserved[3];
+    } else {
+      aux_slice[0] = 0.0f;
+      aux_slice[1] = std::numeric_limits<float>::quiet_NaN();
+    }
+  }
+  result.push_back(std::move(aux_targets_tensor));
 
   return result;
 }
@@ -200,12 +275,10 @@ void TensorGenerator::ProcessPlanes(const std::vector<FrameType>& frames,
     }
 
     const bool zero_geometric_planes =
-        input_plane_format_ ==
-        TensorGeneratorConfig::INPUT_PLANE_FORMAT_ZEROED;
+        input_plane_format_ == TensorGeneratorConfig::INPUT_PLANE_FORMAT_ZEROED;
     std::optional<Dn1Planes> dn1_planes;
     if (!zero_geometric_planes &&
-        input_plane_format_ ==
-            TensorGeneratorConfig::INPUT_PLANE_FORMAT_DN1) {
+        input_plane_format_ == TensorGeneratorConfig::INPUT_PLANE_FORMAT_DN1) {
       dn1_planes = ComputeDn1Planes(frame);
     }
 

@@ -17,7 +17,8 @@ from jax import tree_util
 from lczero_training.dataloader import make_dataloader
 from lczero_training.model.loss_function import LczeroLoss
 from lczero_training.model.model import LczeroModel
-from lczero_training.training.state import TrainingState
+from lczero_training.training.optimizer import make_gradient_transformation
+from lczero_training.training.state import TrainingBatch, TrainingState
 from proto.root_config_pb2 import RootConfig
 
 from .training import Training, from_dataloader
@@ -25,13 +26,10 @@ from .training import Training, from_dataloader
 logger = logging.getLogger(__name__)
 
 
-def _prepare_batch(batch_tuple: tuple) -> Dict:
-    # DataLoader now returns tuple: (inputs, probabilities, values)
-    return {
-        "inputs": batch_tuple[0],
-        "probabilities": batch_tuple[1],
-        "values": batch_tuple[2],
-    }
+def _prepare_batch(batch_tuple: tuple) -> TrainingBatch:
+    # DataLoader returns tuple: (inputs, probabilities, values,
+    # aux_indices, aux_targets).
+    return TrainingBatch.from_tuple(batch_tuple)
 
 
 def _make_optimizer_with_schedule(
@@ -57,21 +55,23 @@ def _make_optimizer_with_schedule(
 
 def _make_eval_step(
     graphdef: nnx.GraphDef, loss_fn: LczeroLoss
-) -> Callable[[nnx.State, Dict], jax.Array]:
+) -> Callable[[nnx.State, TrainingBatch], jax.Array]:
     @partial(nnx.jit, static_argnames=())
-    def eval_step(model_state: nnx.State, batch: Dict) -> jax.Array:
+    def eval_step(model_state: nnx.State, batch: TrainingBatch) -> jax.Array:
         model = nnx.merge(graphdef, model_state)
 
         def calculate_loss(
-            model_arg: LczeroModel, batch_arg: Dict
+            model_arg: LczeroModel, batch_arg: TrainingBatch
         ) -> Tuple[jax.Array, Dict[str, jax.Array]]:
-            return loss_fn(model_arg, **batch_arg)
+            # vmap distributes TrainingBatch over the batch dimension,
+            # passing single samples to the loss function.
+            return loss_fn(model_arg, batch_arg)  # type: ignore[arg-type]
 
         loss_vfn = jax.vmap(calculate_loss, in_axes=(None, 0), out_axes=0)
         per_sample_data_loss, _ = loss_vfn(model, batch)
         return jnp.mean(per_sample_data_loss)
 
-    return cast(Callable[[nnx.State, Dict], jax.Array], eval_step)
+    return cast(Callable[[nnx.State, TrainingBatch], jax.Array], eval_step)
 
 
 def _plot_results(results: List[Tuple[float, float]], plot_output: str) -> None:

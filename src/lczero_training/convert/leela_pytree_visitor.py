@@ -6,6 +6,24 @@ from flax import nnx
 from proto import net_pb2
 
 
+def _optional_layer(
+    message: Any, field_name: str
+) -> Optional[net_pb2.Weights.Layer]:
+    """Returns the given Layer field, or None when this version of
+    net.proto does not define it (some fields come from unpublished lc0
+    proto extensions)."""
+    return getattr(message, field_name, None)
+
+
+def _safe_has_field(message: Any, field_name: str) -> bool:
+    """HasField that returns False when the field does not exist in this
+    version of the proto (instead of raising ValueError)."""
+    try:
+        return bool(message.HasField(field_name))
+    except ValueError:
+        return False
+
+
 class LeelaPytreeWeightsVisitor:
     def __init__(self, nnx_state: nnx.State, leela_net: net_pb2.Net) -> None:
         self.leela_net = leela_net
@@ -73,8 +91,8 @@ class LeelaPytreeWeightsVisitor:
             nnx_dict["norm"],
             weights.ip_emb_ln_gammas,
             weights.ip_emb_ln_betas,
-            weights.ip_emb_ln_alphas,
-            weights.ip_emb_ln_shifts,
+            _optional_layer(weights, "ip_emb_ln_alphas"),
+            _optional_layer(weights, "ip_emb_ln_shifts"),
         )
         self.tensor(
             nnx_dict["ma_gating"]["mult_gate"]["gate"], weights.ip_mult_gate
@@ -87,8 +105,8 @@ class LeelaPytreeWeightsVisitor:
             nnx_dict["out_norm"],
             weights.ip_emb_ffn_ln_gammas,
             weights.ip_emb_ffn_ln_betas,
-            weights.ip_emb_ffn_ln_alphas,
-            weights.ip_emb_ffn_ln_shifts,
+            _optional_layer(weights, "ip_emb_ffn_ln_alphas"),
+            _optional_layer(weights, "ip_emb_ffn_ln_shifts"),
         )
 
     def encoder_tower(
@@ -117,22 +135,27 @@ class LeelaPytreeWeightsVisitor:
             nnx_dict["ln1"],
             weights.ln1_gammas,
             weights.ln1_betas,
-            weights.ln1_alphas,
-            weights.ln1_shifts,
+            _optional_layer(weights, "ln1_alphas"),
+            _optional_layer(weights, "ln1_shifts"),
         )
         self.ffn(nnx_dict["ffn"], weights.ffn)
         self.layernorm(
             nnx_dict["ln2"],
             weights.ln2_gammas,
             weights.ln2_betas,
-            weights.ln2_alphas,
-            weights.ln2_shifts,
+            _optional_layer(weights, "ln2_alphas"),
+            _optional_layer(weights, "ln2_shifts"),
         )
 
     def mha(self, nnx_dict: nnx.State, weights: net_pb2.Weights.MHA) -> None:
         self.matmul(nnx_dict["q"], weights.q_w, weights.q_b)
         if "q_scale" in nnx_dict:
-            self.tensor(nnx_dict["q_scale"], weights.q_scale)
+            q_scale = _optional_layer(weights, "q_scale")
+            assert q_scale is not None, (
+                "Model uses q_scale but this net.proto has no "
+                "Weights.MHA.q_scale field."
+            )
+            self.tensor(nnx_dict["q_scale"], q_scale)
         self.matmul(nnx_dict["k"], weights.k_w, weights.k_b)
         self.matmul(nnx_dict["v"], weights.v_w, weights.v_b)
         self.smolgen(nnx_dict["smolgen"], weights.smolgen)
@@ -291,9 +314,14 @@ class LeelaPytreeWeightsVisitor:
     def ffn(self, nnx_dict: nnx.State, ffn: net_pb2.Weights.FFN) -> None:
         self.matmul(nnx_dict["linear1"], ffn.dense1_w, ffn.dense1_b)
         if "linear_gate" in nnx_dict:
-            self.matmul(nnx_dict["linear_gate"], ffn.dense_gate_w, None)
+            dense_gate_w = _optional_layer(ffn, "dense_gate_w")
+            assert dense_gate_w is not None, (
+                "Model uses a gated FFN but this net.proto has no "
+                "Weights.FFN.dense_gate_w field."
+            )
+            self.matmul(nnx_dict["linear_gate"], dense_gate_w, None)
         else:
-            assert not ffn.HasField("dense_gate_w")
+            assert not _safe_has_field(ffn, "dense_gate_w")
         self.matmul(nnx_dict["linear2"], ffn.dense2_w, ffn.dense2_b)
 
     def matmul(

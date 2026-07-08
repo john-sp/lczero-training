@@ -6,11 +6,16 @@ import optax
 from flax import nnx
 from jax.scipy.special import xlogy
 
-from lczero_training.training.state import TrainingSample
+from lczero_training.training.state import (
+    INVALID_MOVE_INDEX,
+    TrainingSample,
+)
 from lczero_training.training.utils import make_weights_mask
 from proto.training_config_pb2 import (
+    ChildQLossConfig,
     LossConfig,
     MovesLeftLossConfig,
+    PolicyIndexLossConfig,
     PolicyLossConfig,
     RegularizationLossConfig,
     TeacherConfig,
@@ -23,6 +28,25 @@ from .model import LczeroModel, ModelPrediction
 
 
 MASKED_POLICY_LOGIT = -1.0e10
+
+# Number of provenance classes in aux_targets column 0:
+# 0=none, 1=tablebase, 2=noise-deblunder, 3=unintended-deblunder.
+NUM_PROVENANCE_CLASSES = 4
+
+
+def _masked_mean(losses: jax.Array, mask: jax.Array) -> jax.Array:
+    """Sum of `losses` where `mask`, normalized by the number of unmasked
+    entries (guarding against an all-masked batch, which yields 0.0).
+
+    When called with per-sample scalars (inside the training vmap), this
+    reduces to `loss` for unmasked samples and 0.0 for masked ones; the
+    batch mean applied outside the vmap then normalizes by batch size
+    rather than by unmasked count. When called on a full batch (as in unit
+    tests or non-vmap evaluation), it normalizes by the unmasked count.
+    """
+    total = jnp.sum(jnp.where(mask, losses, 0.0))
+    count = jnp.sum(mask.astype(losses.dtype))
+    return total / jnp.maximum(count, 1.0)
 
 
 def mask_illegal_policy_logits(
@@ -93,6 +117,8 @@ class LossBase:
             MovesLeftLossConfig,
             ValueErrorLossConfig,
             ValueCategoricalLossConfig,
+            PolicyIndexLossConfig,
+            ChildQLossConfig,
         ],
     ) -> None:
         self.head_name = config.head_name
@@ -137,6 +163,8 @@ class LczeroLoss:
     value_error_losses: List["ValueErrorLoss"]
     value_categorical_losses: List["ValueCategoricalLoss"]
     regularization_losses: List["RegularizationLoss"]
+    policy_index_losses: List["PolicyIndexLoss"]
+    child_q_losses: List["ChildQLoss"]
 
     def __init__(
         self,
@@ -165,6 +193,12 @@ class LczeroLoss:
             RegularizationLoss(loss_config)
             for loss_config in config.regularization
         ]
+        self.policy_index_losses = [
+            PolicyIndexLoss(loss_config) for loss_config in config.policy_index
+        ]
+        self.child_q_losses = [
+            ChildQLoss(loss_config) for loss_config in config.child_q
+        ]
 
         def _validate_no_duplicate_metrics(
             loss_type_name: str,
@@ -188,6 +222,8 @@ class LczeroLoss:
         _validate_no_duplicate_metrics(
             "regularization", self.regularization_losses
         )
+        _validate_no_duplicate_metrics("policy_index", self.policy_index_losses)
+        _validate_no_duplicate_metrics("child_q", self.child_q_losses)
         self._loss_weights: Dict[str, float] = {}
         for policy_loss in self.policy_losses:
             self._loss_weights[f"policy/{policy_loss.metric_name}"] = (
@@ -212,6 +248,14 @@ class LczeroLoss:
         for reg_loss in self.regularization_losses:
             self._loss_weights[f"regularization/{reg_loss.metric_name}"] = (
                 reg_loss.weight
+            )
+        for policy_index_loss in self.policy_index_losses:
+            self._loss_weights[
+                f"policy_index/{policy_index_loss.metric_name}"
+            ] = policy_index_loss.weight
+        for child_q_loss in self.child_q_losses:
+            self._loss_weights[f"child_q/{child_q_loss.metric_name}"] = (
+                child_q_loss.weight
             )
         if self.teacher_config is not None:
             self._register_teacher_loss_weights()
@@ -348,6 +392,18 @@ class LczeroLoss:
             ] = loss
             weighted_losses.append(loss * value_categorical_loss.weight)
 
+        for policy_index_loss in self.policy_index_losses:
+            loss = policy_index_loss(predictions, sample)
+            unweighted_losses[
+                f"policy_index/{policy_index_loss.metric_name}"
+            ] = loss
+            weighted_losses.append(loss * policy_index_loss.weight)
+
+        for child_q_loss in self.child_q_losses:
+            loss = child_q_loss(predictions, sample)
+            unweighted_losses[f"child_q/{child_q_loss.metric_name}"] = loss
+            weighted_losses.append(loss * child_q_loss.weight)
+
         for reg_loss in self.regularization_losses:
             loss = reg_loss(model)
             unweighted_losses[f"regularization/{reg_loss.metric_name}"] = loss
@@ -419,6 +475,19 @@ class ValueLoss(LossBase):
     def __init__(self, config: ValueLossConfig) -> None:
         super().__init__(config)
         self.value_type = config.value_type
+        if len(config.provenance_weights) == 0:
+            self.provenance_weights: Optional[jax.Array] = None
+        else:
+            if len(config.provenance_weights) != NUM_PROVENANCE_CLASSES:
+                raise ValueError(
+                    f"provenance_weights for value head "
+                    f"'{config.head_name}' must have exactly "
+                    f"{NUM_PROVENANCE_CLASSES} entries, got "
+                    f"{len(config.provenance_weights)}"
+                )
+            self.provenance_weights = jnp.asarray(
+                list(config.provenance_weights), dtype=jnp.float32
+            )
 
     def __call__(
         self,
@@ -440,6 +509,21 @@ class ValueLoss(LossBase):
             logits=value_logits, labels=jax.lax.stop_gradient(value_wdl)
         )
         assert isinstance(value_cross_entropy, jax.Array)
+
+        # Optionally weight each sample by the provenance class of its
+        # value target (aux_targets column 0).
+        if self.provenance_weights is not None:
+            assert sample.aux_targets is not None, (
+                "provenance_weights requires the aux_targets tensor"
+            )
+            provenance = jnp.clip(
+                sample.aux_targets[..., 0].astype(jnp.int32),
+                0,
+                NUM_PROVENANCE_CLASSES - 1,
+            )
+            value_cross_entropy = (
+                value_cross_entropy * self.provenance_weights[provenance]
+            )
         return value_cross_entropy
 
     def compute_accuracy(
@@ -652,6 +736,92 @@ class PolicyLoss(LossBase):
         return jnp.any(top_k_moves == target_move[..., None], axis=-1).astype(
             jnp.float32
         )
+
+
+class PolicyIndexLoss(LossBase):
+    """One-hot cross-entropy of a policy-shaped head against a move index.
+
+    The target is a single move index from aux_indices (column 0 for
+    OPP_PLAYED, column 1 for NEXT_PLAYED). Samples where the index is
+    INVALID_MOVE_INDEX (65535, i.e. no such move near the end of a game)
+    get zero weight; the result is normalized by the number of unmasked
+    samples (see _masked_mean for the per-sample vmap caveat) and an
+    all-masked batch yields 0.0 rather than NaN.
+    """
+
+    _TARGET_COLUMNS = {
+        PolicyIndexLossConfig.OPP_PLAYED: 0,
+        PolicyIndexLossConfig.NEXT_PLAYED: 1,
+    }
+
+    def __init__(self, config: PolicyIndexLossConfig) -> None:
+        super().__init__(config)
+        self.target_column = self._TARGET_COLUMNS[config.target]
+
+    def __call__(
+        self,
+        predictions: ModelPrediction,
+        sample: TrainingSample,
+    ) -> jax.Array:
+        logits = predictions.policy[self.head_name]
+        assert sample.aux_indices is not None, (
+            "PolicyIndexLoss requires the aux_indices tensor"
+        )
+        index = sample.aux_indices[..., self.target_column].astype(jnp.int32)
+        mask = index != INVALID_MOVE_INDEX
+        safe_index = jnp.where(mask, index, 0)
+        cross_entropy = optax.softmax_cross_entropy_with_integer_labels(
+            logits=logits, labels=safe_index
+        )
+        assert isinstance(cross_entropy, jax.Array)
+        return _masked_mean(cross_entropy, mask)
+
+
+class ChildQLoss(LossBase):
+    """MSE between a policy-shaped head's output at the played-move index
+    and the played-move child-Q target.
+
+    The head output is gathered at aux_indices column 2 (played_idx) and
+    regressed against aux_targets column 1 (child-Q). Samples with NaN
+    child-Q (no value available, e.g. the last record of a game) get zero
+    weight; the result is normalized by the number of unmasked samples
+    (see _masked_mean for the per-sample vmap caveat) and an all-masked
+    batch yields 0.0 rather than NaN.
+    """
+
+    PLAYED_INDEX_COLUMN = 2
+    CHILD_Q_COLUMN = 1
+
+    def __init__(self, config: ChildQLossConfig) -> None:
+        super().__init__(config)
+
+    def __call__(
+        self,
+        predictions: ModelPrediction,
+        sample: TrainingSample,
+    ) -> jax.Array:
+        outputs = predictions.policy[self.head_name]
+        assert sample.aux_indices is not None, (
+            "ChildQLoss requires the aux_indices tensor"
+        )
+        assert sample.aux_targets is not None, (
+            "ChildQLoss requires the aux_targets tensor"
+        )
+        index = sample.aux_indices[..., self.PLAYED_INDEX_COLUMN].astype(
+            jnp.int32
+        )
+        target = sample.aux_targets[..., self.CHILD_Q_COLUMN]
+        mask = jnp.logical_and(
+            jnp.logical_not(jnp.isnan(target)),
+            index != INVALID_MOVE_INDEX,
+        )
+        safe_index = jnp.where(mask, index, 0)
+        predicted = jnp.take_along_axis(
+            outputs, jnp.expand_dims(safe_index, -1), axis=-1
+        ).squeeze(-1)
+        safe_target = jnp.where(mask, target, 0.0)
+        squared_error = jnp.square(predicted - safe_target)
+        return _masked_mean(squared_error, mask)
 
 
 class MovesLeftLoss(LossBase):

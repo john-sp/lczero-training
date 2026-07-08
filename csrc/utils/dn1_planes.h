@@ -28,7 +28,6 @@
 #pragma once
 
 #include "chess/bitboard.h"
-#include "chess/board.h"
 #include "loader/frame_type.h"
 
 namespace lczero::training {
@@ -56,8 +55,7 @@ constexpr int kDn1TheirPassedPawnsPlane = 102;
 
 constexpr int kDn1LegalChecksPlane = 103;
 
-
-constexpr int kSeeThreshold = kTacticalSeeThreshold;
+constexpr int kSeeThreshold = 1;
 
 struct Dn1Planes {
   BitBoard our_pins{0};

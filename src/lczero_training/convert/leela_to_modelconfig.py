@@ -1,4 +1,22 @@
+from typing import Optional
+
 from proto import hlo_pb2, model_config_pb2, net_pb2
+
+
+def _netformat_enum_or_none(name: str) -> Optional[int]:
+    """Value of a NetworkFormat enum symbol, or None if this net.proto
+    predates it (some symbols come from unpublished lc0 proto extensions).
+    """
+    return getattr(net_pb2.NetworkFormat, name, None)
+
+
+def _safe_has_field(message: object, field_name: str) -> bool:
+    """HasField that returns False when the field does not exist in this
+    version of the proto (instead of raising ValueError)."""
+    try:
+        return message.HasField(field_name)  # type: ignore[attr-defined]
+    except ValueError:
+        return False
 
 
 def _network_structure_to_block_style(
@@ -9,9 +27,8 @@ def _network_structure_to_block_style(
         == net_pb2.NetworkFormat.NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT
     ):
         return model_config_pb2.EncoderConfig.ENCODER_BLOCK_STYLE_SEQUENTIAL
-    if (
-        network_structure
-        == net_pb2.NetworkFormat.NETWORK_ATTENTIONBODY_PALM_PARALLEL_WITH_MULTIHEADFORMAT
+    if network_structure == _netformat_enum_or_none(
+        "NETWORK_ATTENTIONBODY_PALM_PARALLEL_WITH_MULTIHEADFORMAT"
     ):
         return model_config_pb2.EncoderConfig.ENCODER_BLOCK_STYLE_PALM_PARALLEL
     raise ValueError(
@@ -38,7 +55,17 @@ def leela_to_modelconfig(
     assert weights_dtype == hlo_pb2.XlaShapeProto.F32, (
         "Only float32 weights are supported."
     )
-    assert leela_net.format.weights_encoding == net_pb2.Format.LINEAR16
+    if leela_net.format.weights_encoding != net_pb2.Format.LINEAR16:
+        # Nets exported with per-layer encodings (e.g. FLOAT16, requiring
+        # lc0 >= 0.33) leave the global weights_encoding unset and declare
+        # the encoding on each Layer instead.
+        layer_encoding = leela_net.weights.ip_emb_b.encoding
+        assert layer_encoding in (
+            net_pb2.Weights.Layer.LINEAR16,
+            net_pb2.Weights.Layer.FLOAT16,
+        ), "Unsupported weights encoding: global={}, per-layer={}".format(
+            leela_net.format.weights_encoding, layer_encoding
+        )
     leela_net_format = leela_net.format.network_format
     model_config = model_config_pb2.ModelConfig()
 
@@ -60,10 +87,12 @@ def leela_to_modelconfig(
     policy_format = leela_net_format.policy
     value_format = leela_net_format.value
     moves_left_format = leela_net_format.moves_left
+    # The *_SIMPLE formats only exist in an extended net.proto; when the
+    # pinned proto lacks them, no net parsed with it can use them.
     is_simple = (
-        policy_format == net_pb2.NetworkFormat.POLICY_SIMPLE
-        and value_format == net_pb2.NetworkFormat.VALUE_SIMPLE_WDL
-        and moves_left_format == net_pb2.NetworkFormat.MOVES_LEFT_SIMPLE
+        policy_format == _netformat_enum_or_none("POLICY_SIMPLE")
+        and value_format == _netformat_enum_or_none("VALUE_SIMPLE_WDL")
+        and moves_left_format == _netformat_enum_or_none("MOVES_LEFT_SIMPLE")
     )
     is_regular = (
         policy_format == net_pb2.NetworkFormat.POLICY_ATTENTION
@@ -95,11 +124,13 @@ def leela_to_modelconfig(
     model_config.encoder.num_blocks = len(weights.encoder)
     assert model_config.encoder.num_blocks > 0
     encoder = weights.encoder[0]
+    # The ln*_alphas/ln*_shifts (dynamic ERF) fields only exist in an
+    # extended net.proto; treat them as absent when the proto lacks them.
     has_dynamic_erf = any(
-        block.HasField("ln1_alphas")
-        or block.HasField("ln1_shifts")
-        or block.HasField("ln2_alphas")
-        or block.HasField("ln2_shifts")
+        _safe_has_field(block, "ln1_alphas")
+        or _safe_has_field(block, "ln1_shifts")
+        or _safe_has_field(block, "ln2_alphas")
+        or _safe_has_field(block, "ln2_shifts")
         for block in weights.encoder
     )
     if has_dynamic_erf:
@@ -148,7 +179,8 @@ def leela_to_modelconfig(
 
     model_config.encoder.use_bias_k = encoder.mha.HasField("k_b")
     model_config.encoder.use_bias_v = encoder.mha.HasField("v_b")
-    model_config.encoder.use_q_scale = encoder.mha.HasField("q_scale")
+    # q_scale only exists in an extended net.proto.
+    model_config.encoder.use_q_scale = _safe_has_field(encoder.mha, "q_scale")
 
     if encoder.mha.HasField("k_b"):
         model_config.encoder.kv_heads = size(encoder.mha.k_b) // head_depth

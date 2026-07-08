@@ -50,8 +50,7 @@ class ActivationSketchSink:
 
     def __init__(self, sketches: Mapping[str, ActivationSketch]) -> None:
         self.sketches = {
-            _canonical_tap_name(tap): sketch
-            for tap, sketch in sketches.items()
+            _canonical_tap_name(tap): sketch for tap, sketch in sketches.items()
         }
 
     def __call__(self, tap_name: str, activation: jax.Array) -> None:
@@ -111,7 +110,9 @@ def populate_activation_cache(
         raise ValueError("n_batches must be positive.")
     batches = []
     for idx, batch in enumerate(_iter_dataloader_batches(dataloader)):
-        logger.info("Populating activation cache: batch %d/%d", idx + 1, n_batches)
+        logger.info(
+            "Populating activation cache: batch %d/%d", idx + 1, n_batches
+        )
         if idx >= n_batches:
             break
         if len(batch) != 3:

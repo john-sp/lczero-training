@@ -116,15 +116,37 @@ def _make_format(model_config: model_config_pb2.ModelConfig) -> net_pb2.Format:
     if block_style == model_config_pb2.EncoderConfig.ENCODER_BLOCK_STYLE_SEQUENTIAL:
         netfmt.network = netfmt.NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT
     elif block_style == model_config_pb2.EncoderConfig.ENCODER_BLOCK_STYLE_PALM_PARALLEL:
-        netfmt.network = (
-            netfmt.NETWORK_ATTENTIONBODY_PALM_PARALLEL_WITH_MULTIHEADFORMAT
+        palm_network = getattr(
+            netfmt,
+            "NETWORK_ATTENTIONBODY_PALM_PARALLEL_WITH_MULTIHEADFORMAT",
+            None,
         )
+        if palm_network is None:
+            raise ValueError(
+                "Model uses the PaLM-parallel block style but this "
+                "net.proto has no NETWORK_ATTENTIONBODY_PALM_PARALLEL_"
+                "WITH_MULTIHEADFORMAT network structure."
+            )
+        netfmt.network = palm_network
     else:
         raise ValueError(f"Unsupported encoder block style: {block_style}")
     if model_config.HasField("headpremap"):
-        netfmt.policy = netfmt.POLICY_SIMPLE
-        netfmt.value = netfmt.VALUE_SIMPLE_WDL
-        netfmt.moves_left = netfmt.MOVES_LEFT_SIMPLE
+        policy_simple = getattr(netfmt, "POLICY_SIMPLE", None)
+        value_simple = getattr(netfmt, "VALUE_SIMPLE_WDL", None)
+        moves_left_simple = getattr(netfmt, "MOVES_LEFT_SIMPLE", None)
+        if (
+            policy_simple is None
+            or value_simple is None
+            or moves_left_simple is None
+        ):
+            raise ValueError(
+                "Model uses simple heads but this net.proto has no "
+                "POLICY_SIMPLE / VALUE_SIMPLE_WDL / MOVES_LEFT_SIMPLE "
+                "formats."
+            )
+        netfmt.policy = policy_simple
+        netfmt.value = value_simple
+        netfmt.moves_left = moves_left_simple
     else:
         netfmt.policy = netfmt.POLICY_ATTENTION
         netfmt.value = netfmt.VALUE_WDL

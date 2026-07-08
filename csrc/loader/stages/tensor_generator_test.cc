@@ -3,7 +3,9 @@
 
 #include "loader/stages/tensor_generator.h"
 
+#include <cmath>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -92,8 +94,8 @@ class TensorGeneratorTest : public ::testing::Test {
                          const std::vector<FrameType>& frames) {
     const size_t batch_size = frames.size();
 
-    // Verify tuple has 3 elements
-    ASSERT_EQ(tensors.size(), 3);
+    // Verify tuple has 5 elements
+    ASSERT_EQ(tensors.size(), 5);
 
     // Verify input tensor: (batch_size, 112, 8, 8)
     const auto* planes_tensor =
@@ -113,14 +115,30 @@ class TensorGeneratorTest : public ::testing::Test {
     EXPECT_EQ(probs_tensor->shape()[0], batch_size);
     EXPECT_EQ(probs_tensor->shape()[1], 1858);
 
-    // Verify values tensor: (batch_size, 6, 3)
+    // Verify values tensor: (batch_size, 7, 3)
     const auto* values_tensor =
         dynamic_cast<const TypedTensor<float>*>(tensors[2].get());
     ASSERT_NE(values_tensor, nullptr);
     EXPECT_EQ(values_tensor->shape().size(), 3);
     EXPECT_EQ(values_tensor->shape()[0], batch_size);
-    EXPECT_EQ(values_tensor->shape()[1], 6);
+    EXPECT_EQ(values_tensor->shape()[1], 7);
     EXPECT_EQ(values_tensor->shape()[2], 3);
+
+    // Verify aux indices tensor: (batch_size, 3) int32.
+    const auto* aux_indices_tensor =
+        dynamic_cast<const TypedTensor<int32_t>*>(tensors[3].get());
+    ASSERT_NE(aux_indices_tensor, nullptr);
+    EXPECT_EQ(aux_indices_tensor->shape().size(), 2);
+    EXPECT_EQ(aux_indices_tensor->shape()[0], batch_size);
+    EXPECT_EQ(aux_indices_tensor->shape()[1], 3);
+
+    // Verify aux targets tensor: (batch_size, 2) float32.
+    const auto* aux_targets_tensor =
+        dynamic_cast<const TypedTensor<float>*>(tensors[4].get());
+    ASSERT_NE(aux_targets_tensor, nullptr);
+    EXPECT_EQ(aux_targets_tensor->shape().size(), 2);
+    EXPECT_EQ(aux_targets_tensor->shape()[0], batch_size);
+    EXPECT_EQ(aux_targets_tensor->shape()[1], 2);
   }
 
   void VerifyTensorData(const TensorTuple& tensors,
@@ -367,6 +385,159 @@ TEST_F(TensorGeneratorTest, VerifiesQDConversion) {
   // Verify best values: q=-0.2, d=0.1 (raw values, no WDL conversion)
   EXPECT_FLOAT_EQ(values_slice[1 * 3 + 0], -0.2f);  // best_q
   EXPECT_FLOAT_EQ(values_slice[1 * 3 + 1], 0.1f);   // best_d
+}
+
+TEST_F(TensorGeneratorTest, V7ReservedSlotsPassthrough) {
+  config_.set_batch_size(2);
+  TensorGenerator generator(config_);
+  generator.SetInputs({input_queue_.get()});
+  generator.Start();
+
+  auto producer = input_queue_->CreateProducer();
+
+  // Frame 0: V7 frame with the reserved block filled by the offline
+  // rescorer.
+  FrameType frame = CreateTestFrame();
+  frame.version = 7;
+  frame.q_st = 0.11f;
+  frame.d_st = 0.22f;
+  frame.opp_played_idx = 123;
+  frame.next_played_idx = 456;
+  frame.played_idx = 789;
+  frame.reserved[0] = 2.0f;    // provenance: noise-deblunder
+  frame.reserved[1] = -0.5f;   // q_st_censored
+  frame.reserved[2] = 0.25f;   // d_st_censored
+  frame.reserved[3] = -0.75f;  // played-move child-Q
+  producer.Put(frame);
+
+  // Frame 1: V7 last record of a game: sentinel lookahead indices and NaN
+  // child-Q must be passed through.
+  FrameType last_frame = CreateTestFrame();
+  last_frame.version = 7;
+  last_frame.q_st = 0.5f;
+  last_frame.d_st = 0.1f;
+  last_frame.opp_played_idx = 65535;
+  last_frame.next_played_idx = 65535;
+  last_frame.played_idx = 17;
+  last_frame.reserved[0] = 1.0f;  // provenance: tablebase
+  last_frame.reserved[1] = 0.9f;
+  last_frame.reserved[2] = 0.05f;
+  last_frame.reserved[3] = std::numeric_limits<float>::quiet_NaN();
+  producer.Put(last_frame);
+  producer.Close();
+
+  auto tensors = generator.output_queue()->Get();
+  ASSERT_EQ(tensors.size(), 5);
+  const auto* values_tensor =
+      dynamic_cast<const TypedTensor<float>*>(tensors[2].get());
+  const auto* aux_indices_tensor =
+      dynamic_cast<const TypedTensor<int32_t>*>(tensors[3].get());
+  const auto* aux_targets_tensor =
+      dynamic_cast<const TypedTensor<float>*>(tensors[4].get());
+  ASSERT_NE(values_tensor, nullptr);
+  ASSERT_NE(aux_indices_tensor, nullptr);
+  ASSERT_NE(aux_targets_tensor, nullptr);
+
+  // Frame 0: row 6 = st_censored from reserved[1]/[2].
+  auto values0 = values_tensor->slice({0});
+  EXPECT_FLOAT_EQ(values0[5 * 3 + 0], 0.11f);   // q_st
+  EXPECT_FLOAT_EQ(values0[5 * 3 + 1], 0.22f);   // d_st
+  EXPECT_TRUE(std::isnan(values0[5 * 3 + 2]));  // st m slot
+  EXPECT_FLOAT_EQ(values0[6 * 3 + 0], -0.5f);   // q_st_censored
+  EXPECT_FLOAT_EQ(values0[6 * 3 + 1], 0.25f);   // d_st_censored
+  EXPECT_TRUE(std::isnan(values0[6 * 3 + 2]));  // st_censored m slot
+
+  auto aux_idx0 = aux_indices_tensor->slice({0});
+  EXPECT_EQ(aux_idx0[0], 123);  // opp_played_idx
+  EXPECT_EQ(aux_idx0[1], 456);  // next_played_idx
+  EXPECT_EQ(aux_idx0[2], 789);  // played_idx
+
+  auto aux_tgt0 = aux_targets_tensor->slice({0});
+  EXPECT_FLOAT_EQ(aux_tgt0[0], 2.0f);    // provenance
+  EXPECT_FLOAT_EQ(aux_tgt0[1], -0.75f);  // child-Q
+
+  // Frame 1: sentinels and NaN passthrough.
+  auto values1 = values_tensor->slice({1});
+  EXPECT_FLOAT_EQ(values1[6 * 3 + 0], 0.9f);
+  EXPECT_FLOAT_EQ(values1[6 * 3 + 1], 0.05f);
+
+  auto aux_idx1 = aux_indices_tensor->slice({1});
+  EXPECT_EQ(aux_idx1[0], 65535);  // sentinel passthrough
+  EXPECT_EQ(aux_idx1[1], 65535);  // sentinel passthrough
+  EXPECT_EQ(aux_idx1[2], 17);
+
+  auto aux_tgt1 = aux_targets_tensor->slice({1});
+  EXPECT_FLOAT_EQ(aux_tgt1[0], 1.0f);
+  EXPECT_TRUE(std::isnan(aux_tgt1[1]));  // NaN child-Q passthrough
+}
+
+TEST_F(TensorGeneratorTest, StCensoredFallsBackForV6Frames) {
+  config_.set_batch_size(2);
+  TensorGenerator generator(config_);
+  generator.SetInputs({input_queue_.get()});
+  generator.Start();
+
+  auto producer = input_queue_->CreateProducer();
+
+  // Frame 0: a raw V6 frame (version 6, reserved block zeroed as done by
+  // the chunk sources when widening V6 records into V7 structs).
+  FrameType v6_frame = CreateTestFrame();
+  v6_frame.version = 6;
+  v6_frame.q_st = 0.33f;
+  v6_frame.d_st = 0.44f;
+  v6_frame.played_idx = 42;
+  producer.Put(v6_frame);
+
+  // Frame 1: a V7 frame whose reserved block is all-zero (e.g. produced by
+  // a writer that does not fill it). Must also fall back to plain st.
+  FrameType v7_zero_frame = CreateTestFrame();
+  v7_zero_frame.version = 7;
+  v7_zero_frame.q_st = -0.6f;
+  v7_zero_frame.d_st = 0.3f;
+  v7_zero_frame.opp_played_idx = 5;
+  v7_zero_frame.next_played_idx = 65535;
+  v7_zero_frame.played_idx = 7;
+  producer.Put(v7_zero_frame);
+  producer.Close();
+
+  auto tensors = generator.output_queue()->Get();
+  const auto* values_tensor =
+      dynamic_cast<const TypedTensor<float>*>(tensors[2].get());
+  const auto* aux_indices_tensor =
+      dynamic_cast<const TypedTensor<int32_t>*>(tensors[3].get());
+  const auto* aux_targets_tensor =
+      dynamic_cast<const TypedTensor<float>*>(tensors[4].get());
+
+  // Frame 0 (V6): st_censored row falls back to plain st values; lookahead
+  // indices are the invalid sentinel; provenance none; child-Q NaN.
+  auto values0 = values_tensor->slice({0});
+  EXPECT_FLOAT_EQ(values0[6 * 3 + 0], 0.33f);
+  EXPECT_FLOAT_EQ(values0[6 * 3 + 1], 0.44f);
+  EXPECT_TRUE(std::isnan(values0[6 * 3 + 2]));
+
+  auto aux_idx0 = aux_indices_tensor->slice({0});
+  EXPECT_EQ(aux_idx0[0], 65535);
+  EXPECT_EQ(aux_idx0[1], 65535);
+  EXPECT_EQ(aux_idx0[2], 42);
+
+  auto aux_tgt0 = aux_targets_tensor->slice({0});
+  EXPECT_FLOAT_EQ(aux_tgt0[0], 0.0f);
+  EXPECT_TRUE(std::isnan(aux_tgt0[1]));
+
+  // Frame 1 (V7, zeroed reserved): st_censored falls back to plain st, but
+  // the V7 lookahead indices are used.
+  auto values1 = values_tensor->slice({1});
+  EXPECT_FLOAT_EQ(values1[6 * 3 + 0], -0.6f);
+  EXPECT_FLOAT_EQ(values1[6 * 3 + 1], 0.3f);
+
+  auto aux_idx1 = aux_indices_tensor->slice({1});
+  EXPECT_EQ(aux_idx1[0], 5);
+  EXPECT_EQ(aux_idx1[1], 65535);
+  EXPECT_EQ(aux_idx1[2], 7);
+
+  auto aux_tgt1 = aux_targets_tensor->slice({1});
+  EXPECT_FLOAT_EQ(aux_tgt1[0], 0.0f);
+  EXPECT_TRUE(std::isnan(aux_tgt1[1]));
 }
 
 }  // namespace training
