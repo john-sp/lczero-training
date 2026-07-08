@@ -139,6 +139,15 @@ ChunkUnpacker::ChunkUnpacker(const ChunkUnpackerConfig& config)
            "set.";
   }
 
+  // position_sampling (diff-focus) weights are only consulted by Worker() in
+  // position_count mode (via FramesToProbabilities). In position_sampling_rate
+  // mode the block is silently ignored, so a config carrying both looks like it
+  // applies diff-focus weighting but does not. Fail loudly instead.
+  CHECK(!(has_rate && config.has_position_sampling()))
+      << "position_sampling (diff-focus) weights are only applied in "
+         "position_count mode; with position_sampling_rate set they would be "
+         "silently ignored -- remove one.";
+
   LOG(INFO) << "Initializing ChunkUnpacker with " << config.threads()
             << " worker threads";
 
