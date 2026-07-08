@@ -215,6 +215,14 @@ chunk_source_loader_test = executable(
   link_with : loader_lib,
 )
 
+tar_chunk_source_test = executable(
+  'tar_chunk_source_test',
+  'csrc/loader/chunk_source/tar_chunk_source_test.cc',
+  include_directories : includes,
+  dependencies : test_deps + [zlib_dep, absl_deps['log']],
+  link_with : loader_lib,
+)
+
 shuffling_chunk_pool_test = executable(
   'shuffling_chunk_pool_test',
   'csrc/loader/stages/shuffling_chunk_pool_test.cc',
@@ -313,6 +321,7 @@ test('stream_shuffler_test', stream_shuffler_test)
 test('queue_test', queue_test)
 test('file_path_provider_test', file_path_provider_test)
 test('chunk_source_loader_test', chunk_source_loader_test)
+test('tar_chunk_source_test', tar_chunk_source_test)
 chunk_source_splitter_test = executable(
   'chunk_source_splitter_test',
   'csrc/loader/stages/chunk_source_splitter_test.cc',

@@ -179,32 +179,50 @@ void TarChunkSource::Index() {
 
     if (header.name[0] == '\0') break;  // End of file.
 
+    // Every tar member (regardless of typeflag) is a 512-byte header optionally
+    // followed by `size` bytes of data, padded up to the next 512-byte block.
+    // The data payload must always be accounted for when advancing to the next
+    // header -- including for metadata-only members such as PAX extended
+    // headers. Skipping only the 512-byte header (as older code did for unknown
+    // typeflags) leaves the payload to be misread as the next header, silently
+    // desyncing the parser for the rest of the archive.
+    const size_t size = ParseOctal(header.size);
+    const uint64_t padded_size =
+        ((static_cast<uint64_t>(size) + 511) / 512) * 512;
+    if (padded_size > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) ||
+        offset > std::numeric_limits<off_t>::max() -
+                     static_cast<off_t>(padded_size)) {
+      LOG(WARNING) << "Truncated tar file " << filename_
+                   << ", declared entry size too large: " << size;
+      break;
+    }
+    const off_t file_offset = offset;
+    offset += static_cast<off_t>(padded_size);
+
     switch (header.typeflag) {
-      case '5':  // Directory
+      case '5':  // Directory (no data payload).
         continue;
-      case '0':  // Regular file
+      case 'x':  // PAX extended header (per-file metadata records).
+      case 'g':  // PAX global extended header (archive-wide metadata records).
+        // The payload holds PAX attribute records (e.g. path=, mtime=). We
+        // don't apply any of these overrides, so having already skipped the
+        // payload above we simply continue to the next real header. This must
+        // NOT be recorded as a chunk.
+        continue;
+      case '0':  // Regular file (ustar).
         break;
       default:
-        LOG(WARNING) << "Unsupported tar header type: " << header.typeflag;
+        // Rate-limited: a per-member warning at multi-MB/s once filled a root
+        // volume. The payload has already been skipped, so parsing stays in
+        // sync regardless.
+        LOG_EVERY_N(WARNING, 1000)
+            << "Skipping unsupported tar header type '" << header.typeflag
+            << "' in " << filename_ << " (rate-limited log)";
         continue;
     }
 
     std::string_view fname(const_cast<const char*>(header.name.data()));
     const std::filesystem::path filepath = std::filesystem::path(fname);
-    const off_t file_offset = offset;
-    const size_t size = ParseOctal(header.size);
-    const uint64_t padded_size =
-        ((static_cast<uint64_t>(size) + 511) / 512) * 512;
-    if (padded_size > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) ||
-        file_offset > std::numeric_limits<off_t>::max() -
-                          static_cast<off_t>(padded_size)) {
-      LOG(WARNING) << "Truncated tar file at " << fname
-                   << ", expected size: " << size
-                   << ", actual size: 0";
-      break;
-    }
-    const off_t new_offset = file_offset + static_cast<off_t>(padded_size);
-    offset = new_offset;
 
     if (filepath.filename() == "LICENSE") continue;
     files_.push_back({file_offset, size, filepath.extension() == ".gz"});
