@@ -115,8 +115,10 @@ def populate_activation_cache(
         )
         if idx >= n_batches:
             break
-        if len(batch) != 3:
-            raise ValueError(f"Expected tuple of 3 tensors, got {len(batch)}.")
+        if len(batch) not in (3, 5):
+            raise ValueError(
+                f"Expected tuple of 3 or 5 tensors, got {len(batch)}."
+            )
         batches.append(jnp.asarray(batch[0]))
     return batches
 
