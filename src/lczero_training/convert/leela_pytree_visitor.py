@@ -164,7 +164,8 @@ class LeelaPytreeWeightsVisitor:
     def smolgen(
         self, nnx_dict: nnx.State, weights: net_pb2.Weights.Smolgen
     ) -> None:
-        self.matmul(nnx_dict["compress"], weights.compress, None)
+        if "compress" in nnx_dict:
+            self.matmul(nnx_dict["compress"], weights.compress, None)
         self.matmul(nnx_dict["dense1"], weights.dense1_w, weights.dense1_b)
         self.layernorm(nnx_dict["ln1"], weights.ln1_gammas, weights.ln1_betas)
         self.matmul(nnx_dict["dense2"], weights.dense2_w, weights.dense2_b)

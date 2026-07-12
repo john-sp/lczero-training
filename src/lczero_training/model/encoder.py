@@ -380,14 +380,20 @@ class Smolgen(nnx.Module):
     ):
         self.heads = heads
         norm_layer = get_norm_layer(defaults.norm_type, allow_dynamic_erf=False)
-        self.compress = nnx.Linear(
-            in_features=in_features,
-            out_features=config.hidden_channels,
-            use_bias=False,
-            rngs=rngs,
-        )
+        self.use_avg_pool = config.use_avg_pool
+        if not self.use_avg_pool:
+            self.compress = nnx.Linear(
+                in_features=in_features,
+                out_features=config.hidden_channels,
+                use_bias=False,
+                rngs=rngs,
+            )
         self.dense1 = nnx.Linear(
-            in_features=config.hidden_channels * 64,
+            in_features=(
+                in_features
+                if self.use_avg_pool
+                else config.hidden_channels * 64
+            ),
             out_features=config.hidden_size,
             use_bias=config.use_bias_dense1,
             rngs=rngs,
@@ -411,13 +417,16 @@ class Smolgen(nnx.Module):
         layer_index: int | None = None,
         activation_sink: ActivationSink | None = None,
     ) -> jax.Array:
-        compressed = self.compress(x).flatten()
+        if self.use_avg_pool:
+            dense1_input = jnp.mean(x, axis=0)
+        else:
+            dense1_input = self.compress(x).flatten()
         if activation_sink is not None and layer_index is not None:
             activation_sink(
                 f"encoders/layers/{layer_index}/mha/smolgen/dense1/kernel",
-                compressed,
+                dense1_input,
             )
-        hidden = self.dense1(compressed)
+        hidden = self.dense1(dense1_input)
         hidden = get_activation(self.activation)(hidden)
         hidden = self.ln1(hidden)
 
