@@ -45,6 +45,7 @@ class SmolgenConfig:
     gen_size: int
     use_bias_dense1: bool
     use_bias_dense2: bool
+    use_avg_pool: bool
 
 
 @dataclasses.dataclass(frozen=True)
@@ -323,20 +324,28 @@ def _smolgen(
     if config is None:
         return Breakdown("Smolgen")
     generated_size = config.gen_size * layer_config.heads
-    children = [
-        Breakdown(
-            "Compress",
-            _linear(
-                in_features,
-                config.hidden_channels,
-                use_bias=False,
-                tokens=_BOARD_SIZE,
-            ),
-        ),
+    children = []
+    if config.use_avg_pool:
+        children.append(Breakdown("Average pool"))
+    else:
+        children.append(
+            Breakdown(
+                "Compress",
+                _linear(
+                    in_features,
+                    config.hidden_channels,
+                    use_bias=False,
+                    tokens=_BOARD_SIZE,
+                ),
+            )
+        )
+    children += [
         Breakdown(
             "Dense 1",
             _linear(
-                config.hidden_channels * _BOARD_SIZE,
+                in_features
+                if config.use_avg_pool
+                else config.hidden_channels * _BOARD_SIZE,
                 config.hidden_size,
                 use_bias=config.use_bias_dense1,
             ),
@@ -573,6 +582,7 @@ def _smolgen_from_proto(
         gen_size=config.gen_size,
         use_bias_dense1=config.use_bias_dense1,
         use_bias_dense2=config.use_bias_dense2,
+        use_avg_pool=config.use_avg_pool,
     )
 
 

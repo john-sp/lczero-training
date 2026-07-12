@@ -196,10 +196,14 @@ def leela_to_modelconfig(
             leela_net_format.smolgen_activation
             or model_config.defaults.activation
         )
-        model_config.encoder.smolgen.hidden_channels = (
-            size(encoder.mha.smolgen.compress)
-            // model_config.embedding.embedding_size
+        model_config.encoder.smolgen.use_avg_pool = not encoder.mha.smolgen.HasField(
+            "compress"
         )
+        if not model_config.encoder.smolgen.use_avg_pool:
+            model_config.encoder.smolgen.hidden_channels = (
+                size(encoder.mha.smolgen.compress)
+                // model_config.embedding.embedding_size
+            )
         model_config.encoder.smolgen.gen_size = (
             size(encoder.mha.smolgen.dense2_b) // weights.headcount
         )

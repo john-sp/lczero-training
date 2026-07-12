@@ -74,6 +74,7 @@ message SmolgenConfig {
   optional pblczero.NetworkFormat.ActivationFunction activation = 5;
   optional bool use_bias_dense1 = 6 [default = true];
   optional bool use_bias_dense2 = 7 [default = true];
+  optional bool use_avg_pool = 8 [default = false]; // Reduces parameter count, less accutate. Makes hidden_channels unused.  
 }
 
 message HeadpremapConfig {

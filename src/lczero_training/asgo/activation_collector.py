@@ -268,6 +268,8 @@ def _expected_d_in(model: LczeroModel, tap_name: str) -> int:
         smolgen = model.encoders.layer_configs[layer_idx].smolgen
         if smolgen is None:
             raise ValueError(f"Tap {tap_name} requires smolgen config.")
+        if smolgen.use_avg_pool:
+            return model.config.encoder.d_model
         return smolgen.hidden_channels * 64
     if "/mha/smolgen/dense2/kernel" in tap_name:
         layer_idx = _layer_index(tap_name)
