@@ -367,7 +367,18 @@ class AsgoTuner:
             config=self.asgo.tournament,
             lc0_path=lc0_path,
             work_dir=self.asgo.checkpoint_path,
+            supports_opening_seed=True,
         )
+
+    def _opening_seed_for_round(self, round_idx: int) -> int | None:
+        base_seed = self.asgo.tournament.opening_seed
+        if base_seed < 0:
+            return None
+        shard_count = max(1, len(self.asgo.tournament.gpu))
+        round_number = (
+            self.iteration * self.asgo.rounds_per_iteration + round_idx
+        )
+        return base_seed + round_number * shard_count
 
     def _run_local_tournament_rounds(
         self,
@@ -495,15 +506,18 @@ class AsgoTuner:
         self,
         prepared: RoundPreparation,
     ) -> TournamentMetricResult:
+        opening_seed = self._opening_seed_for_round(prepared.round_idx)
         if self.asgo.tournament.HasField("fixed_opponent"):
             return self.tournament.evaluate_against_opponents(
                 pos_weights_path=prepared.pos_path,
                 neg_weights_path=prepared.neg_path,
                 rng=prepared.subkey,
+                opening_seed=opening_seed,
             )
         return self.tournament.evaluate_pair(
             pos_weights_path=prepared.pos_path,
             neg_weights_path=prepared.neg_path,
+            opening_seed=opening_seed,
         )
 
     def _submit_prepared_remote_round(
@@ -511,6 +525,7 @@ class AsgoTuner:
         prepared: RoundPreparation,
     ) -> futures.Future[TournamentMetricResult]:
         tournament = cast(RemoteTournamentRunner, self.tournament)
+        opening_seed = self._opening_seed_for_round(prepared.round_idx)
         if self.asgo.tournament.HasField("fixed_opponent"):
             return cast(
                 futures.Future[TournamentMetricResult],
@@ -518,6 +533,7 @@ class AsgoTuner:
                     pos_weights_path=prepared.pos_path,
                     neg_weights_path=prepared.neg_path,
                     rng=prepared.subkey,
+                    opening_seed=opening_seed,
                 ),
             )
         return cast(
@@ -525,6 +541,7 @@ class AsgoTuner:
             tournament.submit_pair(
                 pos_weights_path=prepared.pos_path,
                 neg_weights_path=prepared.neg_path,
+                opening_seed=opening_seed,
             ),
         )
 
@@ -801,9 +818,7 @@ class AsgoTuner:
             "asgo/agzo_basis_orthonormality_error": (
                 self._last_agzo_basis_orthonormality_error
             ),
-            "asgo/agzo_basis_refresh_time_s": (
-                self._last_agzo_refresh_time_s
-            ),
+            "asgo/agzo_basis_refresh_time_s": (self._last_agzo_refresh_time_s),
             "asgo/iteration_time_s": iteration_seconds,
             "asgo/tournament_time_s": tournament_seconds,
         }
