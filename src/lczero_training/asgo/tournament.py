@@ -103,9 +103,15 @@ class TournamentRunner:
         self,
         pos_weights_path: str,
         neg_weights_path: str,
+        *,
+        opening_seed: int | None = None,
     ) -> DirectTournamentResult:
         """Runs theta+ vs theta- and returns W/D/L for theta+."""
-        cmd = self._build_direct_command(pos_weights_path, neg_weights_path)
+        cmd = self._build_direct_command(
+            pos_weights_path,
+            neg_weights_path,
+            opening_seed=opening_seed,
+        )
         return self._run_command_set(
             cmd,
             perspective=ResultPerspective.PLAYER1,
@@ -117,16 +123,22 @@ class TournamentRunner:
         pos_weights_path: str,
         neg_weights_path: str,
         rng: object | None = None,
+        *,
+        opening_seed: int | None = None,
     ) -> OpponentEvaluationResult:
         """Evaluates theta+ and theta- against fixed opponent nets."""
         del rng
         results: list[tuple[float, OpponentComparisonResult]] = []
         for opponent in self.config.fixed_opponent.opponent:
             pos_cmd, perspective = self._build_fixed_opponent_command(
-                pos_weights_path, opponent
+                pos_weights_path,
+                opponent,
+                opening_seed=opening_seed,
             )
             neg_cmd, neg_perspective = self._build_fixed_opponent_command(
-                neg_weights_path, opponent
+                neg_weights_path,
+                opponent,
+                opening_seed=opening_seed,
             )
             if neg_perspective != perspective:
                 raise TournamentError("Mismatched fixed-opponent perspective.")
@@ -156,6 +168,8 @@ class TournamentRunner:
         self,
         pos_weights_path: str,
         neg_weights_path: str,
+        *,
+        opening_seed: int | None = None,
     ) -> list[str]:
         games = 2 * self.config.game_pairs_per_round
         cmd = [
@@ -167,13 +181,15 @@ class TournamentRunner:
         ]
         if self.config.direct_comparison.mirror_openings:
             cmd.append("--mirror-openings")
-        self._add_common_args(cmd)
+        self._add_common_args(cmd, opening_seed=opening_seed)
         return cmd
 
     def _build_fixed_opponent_command(
         self,
         candidate_weights_path: str,
         opponent: Message,
+        *,
+        opening_seed: int | None = None,
     ) -> tuple[list[str], ResultPerspective]:
         games = 2 * self.config.game_pairs_per_round
         mode = self.config.fixed_opponent
@@ -202,14 +218,22 @@ class TournamentRunner:
 
         if mode.mirror_openings:
             cmd.append("--mirror-openings")
-        self._add_common_args(cmd, visits_side=candidate_side)
+        self._add_common_args(
+            cmd,
+            visits_side=candidate_side,
+            opening_seed=opening_seed,
+        )
         if opponent.nodes > 0:
             cmd.append(f"--{opponent_side}.visits={opponent.nodes}")
         cmd.extend(opponent.extra_args)
         return cmd, perspective
 
     def _add_common_args(
-        self, cmd: list[str], *, visits_side: str | None = None
+        self,
+        cmd: list[str],
+        *,
+        visits_side: str | None = None,
+        opening_seed: int | None = None,
     ) -> None:
         if self.config.nodes > 0:
             visits_arg = (
@@ -222,8 +246,10 @@ class TournamentRunner:
             cmd.append(f"--movetime={self.config.movetime}")
         if self.config.opening_book:
             cmd.append(f"--openings-pgn={self.config.opening_book}")
-        if self.config.opening_seed >= 0:
-            cmd.append(f"--opening-seed={self.config.opening_seed}")
+        if opening_seed is None:
+            opening_seed = self.config.opening_seed
+        if opening_seed >= 0:
+            cmd.append(f"--opening-seed={opening_seed}")
         cmd.extend(self.config.extra_args)
 
     def _run_command_set(
@@ -260,8 +286,9 @@ class TournamentRunner:
             if shard_games <= 0:
                 continue
             shard_cmd = _replace_arg(cmd, "--games", str(shard_games))
-            if self.config.opening_seed >= 0:
-                seed = self.config.opening_seed + shard_idx
+            opening_seed = _get_optional_int_arg(cmd, "--opening-seed")
+            if opening_seed is not None:
+                seed = opening_seed + shard_idx
                 shard_cmd = _replace_arg(shard_cmd, "--opening-seed", str(seed))
             shard_cmd.extend(
                 [
@@ -410,16 +437,28 @@ class RemoteTournamentRunner(TournamentRunner):
         self,
         pos_weights_path: str,
         neg_weights_path: str,
+        *,
+        opening_seed: int | None = None,
     ) -> DirectTournamentResult:
-        return self.submit_pair(pos_weights_path, neg_weights_path).result()
+        return self.submit_pair(
+            pos_weights_path,
+            neg_weights_path,
+            opening_seed=opening_seed,
+        ).result()
 
     def submit_pair(
         self,
         pos_weights_path: str,
         neg_weights_path: str,
+        *,
+        opening_seed: int | None = None,
     ) -> futures.Future[DirectTournamentResult]:
         """Queues theta+ vs theta- as one remote ASGO round."""
-        cmd = self._build_direct_command(pos_weights_path, neg_weights_path)
+        cmd = self._build_direct_command(
+            pos_weights_path,
+            neg_weights_path,
+            opening_seed=opening_seed,
+        )
         task = RemoteTournamentTask(
             cmd=cmd,
             perspective=ResultPerspective.PLAYER1,
@@ -437,11 +476,14 @@ class RemoteTournamentRunner(TournamentRunner):
         pos_weights_path: str,
         neg_weights_path: str,
         rng: object | None = None,
+        *,
+        opening_seed: int | None = None,
     ) -> OpponentEvaluationResult:
         return self.submit_against_opponents(
             pos_weights_path,
             neg_weights_path,
             rng=rng,
+            opening_seed=opening_seed,
         ).result()
 
     def submit_against_opponents(
@@ -449,6 +491,8 @@ class RemoteTournamentRunner(TournamentRunner):
         pos_weights_path: str,
         neg_weights_path: str,
         rng: object | None = None,
+        *,
+        opening_seed: int | None = None,
     ) -> futures.Future[OpponentEvaluationResult]:
         """Queues all fixed-opponent commands for one ASGO round."""
         del rng
@@ -456,10 +500,14 @@ class RemoteTournamentRunner(TournamentRunner):
         opponents = list(self.config.fixed_opponent.opponent)
         for opponent in opponents:
             pos_cmd, perspective = self._build_fixed_opponent_command(
-                pos_weights_path, opponent
+                pos_weights_path,
+                opponent,
+                opening_seed=opening_seed,
             )
             neg_cmd, neg_perspective = self._build_fixed_opponent_command(
-                neg_weights_path, opponent
+                neg_weights_path,
+                opponent,
+                opening_seed=opening_seed,
             )
             if neg_perspective != perspective:
                 raise TournamentError("Mismatched fixed-opponent perspective.")
@@ -1072,6 +1120,14 @@ def _get_int_arg(cmd: Sequence[str], flag: str) -> int:
         if arg.startswith(prefix):
             return int(arg[len(prefix) :])
     raise ValueError(f"Command does not contain {flag}.")
+
+
+def _get_optional_int_arg(cmd: Sequence[str], flag: str) -> int | None:
+    prefix = f"{flag}="
+    for arg in cmd:
+        if arg.startswith(prefix):
+            return int(arg[len(prefix) :])
+    return None
 
 
 def _replace_arg(cmd: Sequence[str], flag: str, value: str) -> list[str]:
