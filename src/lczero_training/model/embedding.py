@@ -5,7 +5,7 @@ from flax import nnx
 from proto import model_config_pb2
 
 from .shared import Ffn
-from .utils import get_activation, get_norm_layer
+from .utils import get_activation, get_dtype, get_norm_layer
 
 
 class Embedding(nnx.Module):
@@ -26,11 +26,13 @@ class Embedding(nnx.Module):
         embedding_size = config.embedding_size
         self.activation = defaults.activation
         norm_layer = get_norm_layer(defaults.norm_type)
+        cdt = get_dtype(defaults.compute_dtype)
 
         assert dense_size > 0
         self.preprocess = nnx.Linear(
             in_features=64 * 12,
             out_features=64 * dense_size,
+            dtype=cdt,
             rngs=rngs,
         )
 
@@ -38,9 +40,12 @@ class Embedding(nnx.Module):
         self.embedding = nnx.Linear(
             in_features=input_channels + dense_size,
             out_features=embedding_size,
+            dtype=cdt,
             rngs=rngs,
         )
-        self.norm = norm_layer(embedding_size, epsilon=1e-3, rngs=rngs)
+        self.norm = norm_layer(
+            embedding_size, epsilon=1e-3, dtype=cdt, rngs=rngs
+        )
         self.ma_gating = MaGating(feature_shape=(64, embedding_size), rngs=rngs)
         self.deepnorm_alpha = deepnorm_alpha
         self.ffn = Ffn(
@@ -48,9 +53,12 @@ class Embedding(nnx.Module):
             hidden_features=config.dff,
             hidden_activation=defaults.ffn_activation,
             deepnorm_beta=deepnorm_beta,
+            dtype=cdt,
             rngs=rngs,
         )
-        self.out_norm = norm_layer(embedding_size, epsilon=1e-3, rngs=rngs)
+        self.out_norm = norm_layer(
+            embedding_size, epsilon=1e-3, dtype=cdt, rngs=rngs
+        )
 
     def __call__(self, x: jax.Array) -> jax.Array:
         # Preprocess positional info and concatenate to input.
@@ -98,8 +106,10 @@ class Gating(nnx.Module):
         )
 
     def __call__(self, inputs: jax.Array) -> jax.Array:
+        # Cast the float32 master gate to the compute dtype so the result
+        # doesn't get promoted back to float32.
+        gate = self.gate.value.astype(inputs.dtype)
         if self.additive:
-            return inputs + self.gate.value
+            return inputs + gate
 
-        effective_gate = jax.nn.relu(self.gate.value)
-        return inputs * effective_gate
+        return inputs * jax.nn.relu(gate)

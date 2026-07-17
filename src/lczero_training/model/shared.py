@@ -1,6 +1,8 @@
 from collections.abc import Callable
+from typing import Any
 
 import jax
+import jax.numpy as jnp
 from flax import nnx
 from flax.linen import initializers as flax_initializers
 
@@ -22,6 +24,7 @@ class Ffn(nnx.Module):
         hidden_features: int,
         hidden_activation: net_pb2.NetworkFormat.ActivationFunction,
         deepnorm_beta: float,
+        dtype: Any = jnp.float32,
         *,
         rngs: nnx.Rngs,
     ):
@@ -35,6 +38,7 @@ class Ffn(nnx.Module):
             in_features=in_features,
             out_features=hidden_features,
             kernel_init=deepnorm_init,
+            dtype=dtype,
             rngs=rngs,
         )
         self.activation = hidden_activation
@@ -45,6 +49,7 @@ class Ffn(nnx.Module):
                 out_features=hidden_features,
                 use_bias=False,
                 kernel_init=deepnorm_init,
+                dtype=dtype,
                 rngs=rngs,
             )
         else:
@@ -53,6 +58,7 @@ class Ffn(nnx.Module):
             in_features=hidden_features,
             out_features=out_features,
             kernel_init=deepnorm_init,
+            dtype=dtype,
             rngs=rngs,
         )
 

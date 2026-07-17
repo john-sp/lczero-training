@@ -18,8 +18,13 @@ class DynamicErf(nnx.Module):
         alpha_init: float = 0.5,
         shift_init: float = 0.0,
         *,
+        dtype: Any = None,
         rngs: nnx.Rngs,
     ):
+        # `dtype` exists for signature parity with nnx.LayerNorm/RMSNorm so
+        # norm layers are constructed uniformly; the computation already
+        # follows the input dtype (params are cast down in __call__).
+        del dtype
         if isinstance(normalized_shape, int):
             normalized_shape = (normalized_shape,)
 

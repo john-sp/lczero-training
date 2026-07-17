@@ -1,3 +1,5 @@
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -10,6 +12,7 @@ class Headpremap(nnx.Module):
         intermediate_size: int,
         output_size: int,
         use_gating: bool,
+        dtype: Any = jnp.float32,
         *,
         rngs: nnx.Rngs,
     ):
@@ -20,17 +23,19 @@ class Headpremap(nnx.Module):
         self.per_token_reduce = nnx.Linear(
             in_features=in_features,
             out_features=intermediate_size,
+            dtype=dtype,
             rngs=rngs,
         )
         self.global_project = nnx.Linear(
             in_features=64 * intermediate_size,
             out_features=output_size,
+            dtype=dtype,
             rngs=rngs,
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
         if self.use_gating:
-            x = x * self.gate.value
+            x = x * self.gate.value.astype(x.dtype)
         x = self.per_token_reduce(x)
         x = x.flatten()
         return self.global_project(x)

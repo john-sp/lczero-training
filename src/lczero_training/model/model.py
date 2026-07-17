@@ -101,6 +101,7 @@ class LczeroModel(nnx.Module):
                 intermediate_size=config.headpremap.intermediate_size,
                 output_size=config.headpremap.output_size,
                 use_gating=config.headpremap.use_gating,
+                dtype=get_dtype(config.defaults.compute_dtype),
                 rngs=rngs,
             )
             self.simple_value_heads = nnx.Dict(
@@ -164,6 +165,7 @@ class LczeroModel(nnx.Module):
                 self.policy_embedding_shared = nnx.Linear(
                     in_features=config.embedding.embedding_size,
                     out_features=config.shared_policy_embedding_size,
+                    dtype=get_dtype(config.defaults.compute_dtype),
                     rngs=rngs,
                 )
             else:

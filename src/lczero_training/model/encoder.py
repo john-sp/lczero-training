@@ -10,7 +10,7 @@ from flax.linen import initializers as flax_initializers
 from proto import model_config_pb2
 
 from .shared import Ffn
-from .utils import get_activation, get_norm_layer
+from .utils import get_activation, get_dtype, get_norm_layer
 
 ActivationSink = Callable[[str, jax.Array], None]
 
@@ -118,6 +118,7 @@ class EncoderTower(nnx.Module):
                 in_features=config.smolgen.gen_size,
                 out_features=64 * 64,
                 use_bias=False,
+                dtype=get_dtype(defaults.compute_dtype),
                 rngs=rngs,
             )
 
@@ -184,17 +185,19 @@ class EncoderBlock(nnx.Module):
             rngs=rngs,
         )
         norm_layer = get_norm_layer(defaults.norm_type)
+        cdt = get_dtype(defaults.compute_dtype)
 
         self.alpha = math.pow(2.0 * config.num_blocks, -0.25)
-        self.ln1 = norm_layer(in_features, epsilon=1e-3, rngs=rngs)
+        self.ln1 = norm_layer(in_features, epsilon=1e-3, dtype=cdt, rngs=rngs)
         self.ffn = Ffn(
             in_features=in_features,
             hidden_features=layer_config.dff,
             hidden_activation=defaults.ffn_activation,
             deepnorm_beta=deepnorm_beta,
+            dtype=cdt,
             rngs=rngs,
         )
-        self.ln2 = norm_layer(in_features, epsilon=1e-3, rngs=rngs)
+        self.ln2 = norm_layer(in_features, epsilon=1e-3, dtype=cdt, rngs=rngs)
         self.block_style = config.block_style
         if self.block_style not in (
             _SEQUENTIAL_BLOCK_STYLE,
@@ -262,11 +265,13 @@ class MultiHeadAttention(nnx.Module):
         self.kv_heads = kv_heads
         assert self.num_heads % self.kv_heads == 0
         head_depth = depth // self.num_heads
+        cdt = get_dtype(defaults.compute_dtype)
 
         self.q = nnx.Linear(
             in_features=in_features,
             out_features=depth,
             use_bias=use_bias_q,
+            dtype=cdt,
             rngs=rngs,
         )
         self.q_scale = None
@@ -278,6 +283,7 @@ class MultiHeadAttention(nnx.Module):
             in_features=in_features,
             out_features=self.kv_heads * head_depth,
             use_bias=use_bias_k,
+            dtype=cdt,
             rngs=rngs,
         )
         deepnorm_init = flax_initializers.variance_scaling(
@@ -291,12 +297,14 @@ class MultiHeadAttention(nnx.Module):
             out_features=self.kv_heads * head_depth,
             use_bias=use_bias_v,
             kernel_init=deepnorm_init,
+            dtype=cdt,
             rngs=rngs,
         )
         self.output_dense = nnx.Linear(
             in_features=depth,
             out_features=in_features,
             kernel_init=deepnorm_init,
+            dtype=cdt,
             rngs=rngs,
         )
 
@@ -350,7 +358,10 @@ class MultiHeadAttention(nnx.Module):
                 x, layer_index=layer_index, activation_sink=activation_sink
             )
 
-        attention_weights = nnx.softmax(logits, axis=-1)
+        # Softmax in float32 for numerical stability under bf16/f16 compute.
+        attention_weights = nnx.softmax(
+            logits.astype(jnp.float32), axis=-1
+        ).astype(v.dtype)
         scaled_attention = jnp.matmul(attention_weights, v)
 
         # Reshape back to original dimensions.
@@ -380,28 +391,36 @@ class Smolgen(nnx.Module):
     ):
         self.heads = heads
         norm_layer = get_norm_layer(defaults.norm_type, allow_dynamic_erf=False)
+        cdt = get_dtype(defaults.compute_dtype)
         self.compress = nnx.Linear(
             in_features=in_features,
             out_features=config.hidden_channels,
             use_bias=False,
+            dtype=cdt,
             rngs=rngs,
         )
         self.dense1 = nnx.Linear(
             in_features=config.hidden_channels * 64,
             out_features=config.hidden_size,
             use_bias=config.use_bias_dense1,
+            dtype=cdt,
             rngs=rngs,
         )
         # Don't use RMSNorm in Smolgen.
-        self.ln1 = nnx.LayerNorm(config.hidden_size, epsilon=1e-3, rngs=rngs)
+        self.ln1 = nnx.LayerNorm(
+            config.hidden_size, epsilon=1e-3, dtype=cdt, rngs=rngs
+        )
 
         self.dense2 = nnx.Linear(
             in_features=config.hidden_size,
             out_features=config.gen_size * heads,
             use_bias=config.use_bias_dense2,
+            dtype=cdt,
             rngs=rngs,
         )
-        self.ln2 = norm_layer(config.gen_size * heads, epsilon=1e-3, rngs=rngs)
+        self.ln2 = norm_layer(
+            config.gen_size * heads, epsilon=1e-3, dtype=cdt, rngs=rngs
+        )
         self.weight_gen_dense = weight_gen_dense
         self.activation = config.activation or defaults.activation
 
