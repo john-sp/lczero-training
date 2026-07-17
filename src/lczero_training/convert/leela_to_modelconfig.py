@@ -55,17 +55,9 @@ def leela_to_modelconfig(
     assert weights_dtype == hlo_pb2.XlaShapeProto.F32, (
         "Only float32 weights are supported."
     )
-    if leela_net.format.weights_encoding != net_pb2.Format.LINEAR16:
-        # Nets exported with per-layer encodings (e.g. FLOAT16, requiring
-        # lc0 >= 0.33) leave the global weights_encoding unset and declare
-        # the encoding on each Layer instead.
-        layer_encoding = leela_net.weights.ip_emb_b.encoding
-        assert layer_encoding in (
-            net_pb2.Weights.Layer.LINEAR16,
-            net_pb2.Weights.Layer.FLOAT16,
-        ), "Unsupported weights encoding: global={}, per-layer={}".format(
-            leela_net.format.weights_encoding, layer_encoding
-        )
+    # Layer encodings are validated while their tensors are imported. Mixed
+    # files can leave the global encoding unset, omit it on LINEAR16 layers,
+    # and set FLOAT16 only on the layers that override the legacy default.
     leela_net_format = leela_net.format.network_format
     model_config = model_config_pb2.ModelConfig()
 

@@ -101,20 +101,25 @@ class LeelaToJax(LeelaPytreeWeightsVisitor):
         assert len(leela.params) // 2 == math.prod(param.shape)
         assert len(leela.params) != 0
 
-        if leela.encoding == net_pb2.Weights.Layer.FLOAT16:
+        # Lc0 defaults an untagged layer to LINEAR16. An encoding set on an
+        # individual layer overrides that default, allowing mixed files.
+        encoding = leela.encoding or net_pb2.Weights.Layer.LINEAR16
+        if encoding == net_pb2.Weights.Layer.FLOAT16:
             values = jnp.frombuffer(leela.params, dtype=jnp.float16)
             values = values.astype(jnp.float32)
-        elif leela.encoding == net_pb2.Weights.Layer.BFLOAT16:
+        elif encoding == net_pb2.Weights.Layer.BFLOAT16:
             raise NotImplementedError(
                 "BFLOAT16 layer encoding is not supported."
             )
-        else:
-            # UNKNOWN_ENCODING (legacy default) and LINEAR16: min/max
-            # uint16 quantization.
+        elif encoding == net_pb2.Weights.Layer.LINEAR16:
             values = jnp.frombuffer(leela.params, dtype=jnp.uint16)
             values = values.astype(jnp.float32)
             alpha = values / 65535.0
             values = alpha * leela.max_val + (1.0 - alpha) * leela.min_val
+        else:
+            raise ValueError(
+                "Unsupported layer encoding: {}".format(encoding)
+            )
         values = values.astype(param.dtype)
         values = values.reshape(param.shape[::-1]).transpose()
         param.value = values
