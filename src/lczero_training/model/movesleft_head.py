@@ -1,9 +1,10 @@
 import jax
+import jax.numpy as jnp
 from flax import nnx
 
 from proto import model_config_pb2
 
-from .utils import get_activation
+from .utils import get_activation, get_dtype
 
 
 class MovesLeftHead(nnx.Module):
@@ -16,20 +17,24 @@ class MovesLeftHead(nnx.Module):
         rngs: nnx.Rngs,
     ):
         self.activation = defaults.activation
+        cdt = get_dtype(defaults.compute_dtype)
         self.embed = nnx.Linear(
             in_features=in_features,
             out_features=config.num_channels,
+            dtype=cdt,
             rngs=rngs,
         )
 
         self.dense1 = nnx.Linear(
             in_features=config.num_channels * 64,
             out_features=128,
+            dtype=cdt,
             rngs=rngs,
         )
         self.out = nnx.Linear(
             in_features=128,
             out_features=1,
+            dtype=cdt,
             rngs=rngs,
         )
 
@@ -39,4 +44,4 @@ class MovesLeftHead(nnx.Module):
         x = self.dense1(x)
         x = get_activation(self.activation)(x)
         x = self.out(x)
-        return nnx.relu(x)
+        return nnx.relu(x).astype(jnp.float32)

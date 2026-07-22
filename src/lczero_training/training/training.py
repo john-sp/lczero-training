@@ -2,7 +2,16 @@ import dataclasses
 import logging
 from datetime import datetime
 from functools import partial
-from typing import Any, Callable, Dict, Generator, Optional, Tuple, cast
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generator,
+    Optional,
+    Sequence,
+    Tuple,
+    cast,
+)
 
 import jax
 import jax.numpy as jnp
@@ -11,11 +20,16 @@ import numpy as np
 import optax
 from flax import nnx
 from jax import tree_util
+from jax.ad_checkpoint import checkpoint as jax_checkpoint
 from jax.sharding import PartitionSpec as P
 
 from lczero_training.dataloader import DataLoader
-from lczero_training.model.loss_function import LczeroLoss
+from lczero_training.model.loss_function import (
+    LczeroLoss,
+    mask_illegal_policy_logits,
+)
 from lczero_training.model.model import LczeroModel
+from lczero_training.training.utils import make_weights_mask
 from lczero_training.training.state import (
     JitTrainingState,
     TrainingBatch,
@@ -24,6 +38,172 @@ from lczero_training.training.state import (
 from proto import training_config_pb2 as training_config_pb2
 
 MetricsDict = Dict[str, Any]
+EPS = 1e-12
+
+
+@dataclasses.dataclass(frozen=True)
+class AdvancedMetricsOptions:
+    expensive_metrics_period: int = 100
+    enable_weight_decay_ratios: bool = True
+    enable_update_to_weight_ratio: bool = True
+    enable_auxiliary_loss_ratio: bool = True
+    enable_gradient_conflict_ratio: bool = True
+    enable_policy_entropy_logit_scale: bool = True
+    enable_ln2_collapse_diagnostics: bool = True
+
+
+def advanced_metrics_options_from_config(
+    config: training_config_pb2.TrainingConfig,
+) -> AdvancedMetricsOptions:
+    if not config.HasField("advanced_metrics"):
+        return AdvancedMetricsOptions()
+    metrics = config.advanced_metrics
+    configured_period = metrics.expensive_metrics_period
+    if configured_period == -1:
+        period = -1
+    elif configured_period > 0:
+        period = configured_period
+    else:
+        period = 100
+    return AdvancedMetricsOptions(
+        expensive_metrics_period=period,
+        enable_weight_decay_ratios=(
+            metrics.enable_weight_decay_ratios
+            if metrics.HasField("enable_weight_decay_ratios")
+            else True
+        ),
+        enable_update_to_weight_ratio=(
+            metrics.enable_update_to_weight_ratio
+            if metrics.HasField("enable_update_to_weight_ratio")
+            else True
+        ),
+        enable_auxiliary_loss_ratio=(
+            metrics.enable_auxiliary_loss_ratio
+            if metrics.HasField("enable_auxiliary_loss_ratio")
+            else True
+        ),
+        enable_gradient_conflict_ratio=(
+            metrics.enable_gradient_conflict_ratio
+            if metrics.HasField("enable_gradient_conflict_ratio")
+            else True
+        ),
+        enable_policy_entropy_logit_scale=(
+            metrics.enable_policy_entropy_logit_scale
+            if metrics.HasField("enable_policy_entropy_logit_scale")
+            else True
+        ),
+        enable_ln2_collapse_diagnostics=(
+            metrics.enable_ln2_collapse_diagnostics
+            if metrics.HasField("enable_ln2_collapse_diagnostics")
+            else True
+        ),
+    )
+
+
+def _get_array(value: Any) -> jax.Array:
+    if isinstance(value, nnx.Variable):
+        return jnp.asarray(value.value)
+    return jnp.asarray(value)
+
+
+def _leaf_l2_norm(tree: Any) -> jax.Array:
+    leaves = jax.tree_util.tree_leaves(tree)
+    if not leaves:
+        return jnp.array(0.0)
+    total_sq = jnp.array(0.0)
+    for leaf in leaves:
+        array = _get_array(leaf)
+        total_sq += jnp.sum(jnp.square(array))
+    return jnp.sqrt(total_sq)
+
+
+def _norm_scales(norm_layer: Any) -> jax.Array:
+    if hasattr(norm_layer, "scale"):
+        return jnp.asarray(norm_layer.scale.value)
+    if hasattr(norm_layer, "weight"):
+        return jnp.asarray(norm_layer.weight.value)
+    raise ValueError("Unsupported norm layer: missing scale/weight parameter.")
+
+
+def _safe_divide(num: jax.Array, den: jax.Array) -> jax.Array:
+    return num / jnp.maximum(den, jnp.array(EPS, dtype=num.dtype))
+
+
+def _weighted_aux_ratio(
+    weighted_losses: Dict[str, jax.Array], family: str, primary: str
+) -> jax.Array:
+    family_prefix = f"{family}/"
+    total = jnp.array(0.0, dtype=jnp.float32)
+    primary_value = jnp.array(0.0, dtype=jnp.float32)
+    for key, value in weighted_losses.items():
+        if not key.startswith(family_prefix):
+            continue
+        total += jnp.asarray(value, dtype=jnp.float32)
+        if key == f"{family}/{primary}":
+            primary_value = jnp.asarray(value, dtype=jnp.float32)
+    aux = total - primary_value
+    return _safe_divide(aux, total)
+
+
+def _policy_entropy_and_logit_std(
+    policy_logits: jax.Array,
+) -> Tuple[jax.Array, jax.Array]:
+    probs = jax.nn.softmax(policy_logits, axis=-1)
+    entropy = -jnp.sum(probs * jnp.log(jnp.maximum(probs, EPS)), axis=-1)
+    return jnp.mean(entropy), jnp.std(policy_logits)
+
+
+def _masked_policy_entropy_and_logit_std(
+    policy_logits: jax.Array,
+    policy_targets: jax.Array,
+) -> Tuple[jax.Array, jax.Array]:
+    masked_logits = mask_illegal_policy_logits(policy_logits, policy_targets)
+    probs = jax.nn.softmax(masked_logits, axis=-1)
+    entropy = -jnp.sum(probs * jnp.log(jnp.maximum(probs, EPS)), axis=-1)
+
+    legal_mask = (policy_targets >= 0).astype(policy_logits.dtype)
+    legal_count = jnp.sum(legal_mask, axis=-1)
+    safe_count = jnp.maximum(legal_count, jnp.ones_like(legal_count))
+    legal_logits = policy_logits * legal_mask
+    mean = jnp.sum(legal_logits, axis=-1) / safe_count
+    centered = (policy_logits - mean[..., None]) * legal_mask
+    variance = jnp.sum(jnp.square(centered), axis=-1) / safe_count
+    return jnp.mean(entropy), jnp.mean(jnp.sqrt(variance))
+
+
+def _flatten_for_cosine(tree: Any) -> jax.Array:
+    leaves = [
+        jnp.ravel(_get_array(leaf)) for leaf in jax.tree_util.tree_leaves(tree)
+    ]
+    if not leaves:
+        return jnp.zeros((0,), dtype=jnp.float32)
+    return jnp.concatenate(leaves).astype(jnp.float32)
+
+
+def _conflict_ratio_and_cosine(
+    grad_a: Any,
+    grad_b: Any,
+) -> Tuple[jax.Array, jax.Array]:
+    a = _flatten_for_cosine(grad_a)
+    b = _flatten_for_cosine(grad_b)
+    dots = a * b
+    conflict_ratio = jnp.mean((dots < 0).astype(jnp.float32))
+    cosine = _safe_divide(
+        jnp.sum(dots),
+        jnp.linalg.norm(a) * jnp.linalg.norm(b),
+    )
+    return conflict_ratio, cosine
+
+
+def _channel_utilization_index(scales: jax.Array) -> jax.Array:
+    magnitudes = jnp.abs(scales)
+    probs = magnitudes / jnp.maximum(jnp.sum(magnitudes), EPS)
+    entropy = -jnp.sum(probs * jnp.log(jnp.maximum(probs, EPS)))
+    return jnp.exp(entropy) / jnp.array(scales.shape[0], dtype=jnp.float32)
+
+
+def _to_host_int(value: Any) -> int:
+    return int(np.asarray(jax.device_get(value)).reshape(()))
 
 
 @dataclasses.dataclass
@@ -53,18 +233,29 @@ def from_dataloader(
 class Training:
     optimizer_tx: optax.GradientTransformation
     train_step: Callable[
-        [optax.GradientTransformation, JitTrainingState, TrainingBatch],
+        [
+            optax.GradientTransformation,
+            JitTrainingState,
+            TrainingBatch,
+            Optional[nnx.State],
+        ],
         Tuple[JitTrainingState, MetricsDict],
     ]
     _swa_config: Optional[training_config_pb2.SWAConfig]
     _dp_sharding: Optional[jshard.NamedSharding]
+    _advanced_metrics: AdvancedMetricsOptions
 
     def __init__(
         self,
         optimizer_tx: optax.GradientTransformation,
         graphdef: nnx.GraphDef,
         loss_fn: LczeroLoss,
+        optimizer_config: training_config_pb2.OptimizerConfig,
+        lr_schedule: Optional[optax.Schedule] = None,
         swa_config: Optional[training_config_pb2.SWAConfig] = None,
+        teacher_graphdef: Optional[nnx.GraphDef] = None,
+        component_grad_norm_period: int = 0,
+        advanced_metrics: Optional[AdvancedMetricsOptions] = None,
     ):
         self.optimizer_tx = optimizer_tx
         self._swa_config = swa_config
@@ -72,10 +263,69 @@ class Training:
         self._host_step = None
         self._host_metrics = None
         self._host_num_averages = None
+        self._component_grad_norm_period = component_grad_norm_period
+        self._optimizer_config = optimizer_config
+        self._lr_schedule = lr_schedule
+        self._advanced_metrics = advanced_metrics or AdvancedMetricsOptions()
+        self._expensive_metrics_disabled = (
+            self._advanced_metrics.expensive_metrics_period == -1
+        )
+        self._expensive_metrics_period = (
+            self._advanced_metrics.expensive_metrics_period
+            if not self._expensive_metrics_disabled
+            else 0
+        )
+        self._component_metric_keys: tuple[str, ...] = tuple(
+            list(f"policy/{loss.metric_name}" for loss in loss_fn.policy_losses)
+            + list(f"value/{loss.metric_name}" for loss in loss_fn.value_losses)
+            + list(
+                f"movesleft/{loss.metric_name}"
+                for loss in loss_fn.movesleft_losses
+            )
+            + list(
+                f"value_error/{loss.metric_name}"
+                for loss in loss_fn.value_error_losses
+            )
+            + list(
+                f"value_categorical/{loss.metric_name}"
+                for loss in loss_fn.value_categorical_losses
+            )
+            + list(
+                f"policy_index/{loss.metric_name}"
+                for loss in loss_fn.policy_index_losses
+            )
+            + list(
+                f"child_q/{loss.metric_name}" for loss in loss_fn.child_q_losses
+            )
+        )
+        self._primary_component_keys: tuple[str, ...] = tuple(
+            key
+            for key in (
+                "policy/vanilla",
+                "value/winner",
+                "movesleft/main",
+            )
+            if key in self._component_metric_keys
+        )
+        self._aux_component_keys: tuple[str, ...] = tuple(
+            key
+            for key in self._component_metric_keys
+            if key not in self._primary_component_keys
+        )
 
         jit_kwargs: Dict[str, Any] = {
             "static_argnames": ("optimizer_tx","metrics_collector",),
-            "donate_argnames": ("jit_state",),
+            "donate_argnames": ("jit_state","metrics",),
+        }
+
+        # The component-norm computation only reads its arguments and
+        # returns gradient norms.  We subsequently pass the same
+        # `jit_state`/`batch`/`teacher_model_state` to the real train
+        # step, so nothing here may be donated.  There are also no
+        # static arguments: all values change each call.
+        norms_jit_kwargs: Dict[str, Any] = {
+            "static_argnames": (),
+            "donate_argnames": (),
         }
         if jax.device_count() > 1:
             num_devices = jax.device_count()
@@ -91,47 +341,77 @@ class Training:
                 inputs=dp_sharding,
                 probabilities=dp_sharding,
                 values=dp_sharding,
+                aux_indices=dp_sharding,
+                aux_targets=dp_sharding,
             )
-            in_shardings = (replicated, batch_sharding)
+            # jit_state, batch, teacher_model_state
+            # (optimizer_tx is static, so excluded from in_shardings.)
+            in_shardings = (replicated, batch_sharding, replicated)
             out_shardings = replicated
 
             jit_kwargs["in_shardings"] = in_shardings
             jit_kwargs["out_shardings"] = out_shardings
+
+            # Norms function: jit_state, batch, teacher_model_state.
+            norms_jit_kwargs["in_shardings"] = (
+                replicated,
+                batch_sharding,
+                replicated,
+            )
+            norms_jit_kwargs["out_shardings"] = replicated
+
+        # Shared helper: per-sample loss used by both the train step and
+        # the optional component-norm computation.
+        def loss_for_grad(
+            model_arg: LczeroModel,
+            sample_arg: TrainingSample,
+            teacher_model_arg: Optional[LczeroModel] = None,
+        ) -> Tuple[jax.Array, Dict[str, jax.Array]]:
+            return loss_fn(model_arg, sample_arg, teacher_model_arg)
+
+        loss_vfn = jax.vmap(
+            loss_for_grad,
+            in_axes=(None, 0, None),
+            out_axes=0,
+        )
 
         @partial(jax.jit, **jit_kwargs)
         def _step(
             optimizer_tx: optax.GradientTransformation,
             jit_state: JitTrainingState,
             batch: TrainingBatch,
+            metrics: MetricsDict,
             metrics_collector: Optional[MetricsCollector] = None,
+            teacher_model_state: Optional[nnx.State] = None,
         ) -> Tuple[JitTrainingState, MetricsDict]:
             model = nnx.merge(graphdef, jit_state.model_state)
-
-            def loss_for_grad(
-                model_arg: LczeroModel, sample_arg: TrainingSample
-            ) -> Tuple[jax.Array, Dict[str, jax.Array]]:
-                return loss_fn(model_arg, sample_arg)
-
-            loss_vfn = jax.vmap(
-                loss_for_grad,
-                in_axes=(None, 0),  # (model_arg, sample_arg)
-                out_axes=0,
+            teacher_model = (
+                nnx.merge(teacher_graphdef, teacher_model_state)
+                if teacher_graphdef is not None
+                and teacher_model_state is not None
+                else None
             )
 
             def mean_loss_for_grad(
-                model_arg: LczeroModel, batch_arg: TrainingBatch
+                model_arg: LczeroModel,
+                batch_arg: TrainingBatch,
+                teacher_model_arg: Optional[LczeroModel] = None,
             ) -> Tuple[jax.Array, Dict[str, jax.Array]]:
-                # vmap automatically distributes TrainingBatch over batch dimension,
-                # calling loss_for_grad with TrainingSample (single samples).
+                # vmap distributes TrainingBatch over batch dimension,
+                # calling loss_for_grad with TrainingSample (single
+                # samples).
                 per_sample_data_loss, unweighted_losses = loss_vfn(
                     model_arg,
-                    batch_arg,  # type: ignore[arg-type]
+                    batch_arg,
+                    teacher_model_arg,
                 )
                 mean_loss = jnp.mean(per_sample_data_loss)
                 return mean_loss, unweighted_losses
 
             grad_fn = nnx.value_and_grad(mean_loss_for_grad, has_aux=True)
-            (mean_loss, unweighted_losses), mean_grads = grad_fn(model, batch)
+            (mean_loss, unweighted_losses), mean_grads = grad_fn(
+                model, batch, teacher_model
+            )
             grad_norm = optax.global_norm(mean_grads)
 
             assert jit_state.opt_state is not None
@@ -149,23 +429,408 @@ class Training:
             )
 
             mean_unweighted = tree_util.tree_map(jnp.mean, unweighted_losses)
-            metrics: MetricsDict = {
+            weighted_losses = loss_fn.weighted_losses(mean_unweighted)
+            lr_value = (
+                jnp.asarray(self._lr_schedule(jit_state.step))
+                if self._lr_schedule is not None
+                else jnp.array(0.0, dtype=jnp.float32)
+            )
+            optimizer_metrics = self._compute_optimizer_metrics(
+                jit_state.model_state,
+                updates,
+                lr_value,
+            )
+            loss_landscape_metrics = self._compute_loss_landscape_metrics(
+                weighted_losses
+            )
+            new_metrics: MetricsDict = {
                 "loss": mean_loss,
                 "unweighted_losses": mean_unweighted,
+                "weighted_losses": weighted_losses,
                 "grad_norm": grad_norm,
+                "optimizer_metrics": optimizer_metrics,
+                "loss_landscape": loss_landscape_metrics,
             }
             if metrics_collector is not None:
-                metrics = metrics_collector(metrics, jit_state.step - 1)
+                new_metrics = metrics_collector(new_metrics, jit_state.step - 1)
 
-            return new_jit_state, metrics
+            new_metrics.update(metrics)
+
+            return new_jit_state, new_metrics
 
         self.train_step = cast(
             Callable[
-                [optax.GradientTransformation, JitTrainingState, TrainingBatch],
+                [
+                    optax.GradientTransformation,
+                    JitTrainingState,
+                    TrainingBatch,
+                    Optional[nnx.State],
+                ],
                 Tuple[JitTrainingState, MetricsDict],
             ],
             _step,
         )
+        if (
+            not self._expensive_metrics_disabled
+            and component_grad_norm_period > 0
+            and self._component_metric_keys
+        ):
+
+            @partial(jax.jit, **norms_jit_kwargs)
+            def _compute_component_norms(
+                jit_state: JitTrainingState,
+                batch: TrainingBatch,
+                teacher_model_state: Optional[nnx.State] = None,
+            ) -> Dict[str, jax.Array]:
+                model = nnx.merge(graphdef, jit_state.model_state)
+                teacher_model = (
+                    nnx.merge(teacher_graphdef, teacher_model_state)
+                    if teacher_graphdef is not None
+                    and teacher_model_state is not None
+                    else None
+                )
+
+                @jax_checkpoint
+                def remat_loss_vfn(
+                    model_arg: LczeroModel,
+                    batch_arg: TrainingBatch,
+                    teacher_model_arg: Optional[LczeroModel],
+                ) -> Tuple[jax.Array, Dict[str, jax.Array]]:
+                    return loss_vfn(model_arg, batch_arg, teacher_model_arg)
+
+                norms: Dict[str, jax.Array] = {}
+                for key in self._component_metric_keys:
+
+                    def single_loss_fn(
+                        model_arg: LczeroModel,
+                        batch_arg: TrainingBatch,
+                        teacher_model_arg: Optional[LczeroModel] = None,
+                        _key: str = key,
+                    ) -> jax.Array:
+                        _, unweighted = remat_loss_vfn(
+                            model_arg,
+                            batch_arg,
+                            teacher_model_arg,
+                        )
+                        return jnp.mean(unweighted[_key])
+
+                    grads = nnx.grad(single_loss_fn)(
+                        model, batch, teacher_model
+                    )
+                    norms[key] = optax.global_norm(grads)
+                return {'component_norms': norms}
+
+            self._component_norms_fn: Optional[
+                Callable[
+                    [
+                        JitTrainingState,
+                        TrainingBatch,
+                        Optional[nnx.State],
+                    ],
+                    Dict[str, jax.Array],
+                ]
+            ] = _compute_component_norms
+        else:
+            self._component_norms_fn = None
+        self._expensive_metrics_fn: Optional[
+            Callable[
+                [JitTrainingState, TrainingBatch, Optional[nnx.State]],
+                Dict[str, jax.Array],
+            ]
+        ] = None
+        if not self._expensive_metrics_disabled and (
+            self._advanced_metrics.enable_gradient_conflict_ratio
+            or self._advanced_metrics.enable_policy_entropy_logit_scale
+            or self._advanced_metrics.enable_ln2_collapse_diagnostics
+        ):
+            norms_jit_kwargs["donate_argnames"] = ("metrics",)
+
+            @partial(jax.jit, **norms_jit_kwargs)
+            def _compute_expensive_metrics(
+                jit_state: JitTrainingState,
+                batch: TrainingBatch,
+                metrics: MetricsDict,
+                teacher_model_state: Optional[nnx.State] = None,
+            ) -> Dict[str, jax.Array]:
+                model = nnx.merge(graphdef, jit_state.model_state)
+                teacher_model = (
+                    nnx.merge(teacher_graphdef, teacher_model_state)
+                    if teacher_graphdef is not None
+                    and teacher_model_state is not None
+                    else None
+                )
+                new_metrics: Dict[str, jax.Array] = {}
+
+                policy_metrics = self._compute_policy_metrics(model, batch)
+                if policy_metrics:
+                    metrics["policy_vanilla"] = policy_metrics
+
+                ln2_metrics = self._compute_ln2_scale_metrics(model)
+                if ln2_metrics:
+                    metrics["ln2_collapse"] = ln2_metrics
+
+                def loss_for_grad(
+                    model_arg: LczeroModel,
+                    sample_arg: TrainingSample,
+                    teacher_model_arg: Optional[LczeroModel] = None,
+                ) -> Tuple[jax.Array, Dict[str, jax.Array]]:
+                    return loss_fn(model_arg, sample_arg, teacher_model_arg)
+
+                loss_vfn = jax.vmap(
+                    loss_for_grad,
+                    in_axes=(None, 0, None),
+                    out_axes=0,
+                )
+
+                @jax.checkpoint
+                def remat_loss_vfn(
+                    model_arg: LczeroModel,
+                    batch_arg: TrainingBatch,
+                    teacher_model_arg: Optional[LczeroModel],
+                ) -> Tuple[jax.Array, Dict[str, jax.Array]]:
+                    return loss_vfn(model_arg, batch_arg, teacher_model_arg)
+
+                def component_loss(
+                    model_arg: LczeroModel,
+                    batch_arg: TrainingBatch,
+                    teacher_model_arg: Optional[LczeroModel],
+                    key: str,
+                ) -> jax.Array:
+                    _, unweighted = remat_loss_vfn(
+                        model_arg, batch_arg, teacher_model_arg
+                    )
+                    return jnp.mean(unweighted[key])
+
+                def sum_component_loss(
+                    model_arg: LczeroModel,
+                    batch_arg: TrainingBatch,
+                    teacher_model_arg: Optional[LczeroModel],
+                    keys: Sequence[str],
+                ) -> jax.Array:
+                    _, unweighted = remat_loss_vfn(
+                        model_arg, batch_arg, teacher_model_arg
+                    )
+                    total = jnp.array(0.0, dtype=jnp.float32)
+                    for key in keys:
+                        total += jnp.mean(unweighted[key])
+                    return total
+
+                if self._advanced_metrics.enable_gradient_conflict_ratio:
+                    if (
+                        "policy/vanilla" in self._component_metric_keys
+                        and "value/winner" in self._component_metric_keys
+                    ):
+                        policy_grads = nnx.grad(
+                            lambda m, b, t: component_loss(
+                                m, b, t, "policy/vanilla"
+                            )
+                        )(model, batch, teacher_model)
+                        value_grads = nnx.grad(
+                            lambda m, b, t: component_loss(
+                                m, b, t, "value/winner"
+                            )
+                        )(model, batch, teacher_model)
+                        conflict_ratio, mean_cosine = (
+                            _conflict_ratio_and_cosine(
+                                policy_grads["encoders"],
+                                value_grads["encoders"],
+                            )
+                        )
+                        new_metrics[
+                            "grad_conflict/"
+                            "policy_vanilla_vs_value_winner/conflict_ratio"
+                        ] = conflict_ratio
+                        new_metrics[
+                            "grad_conflict/"
+                            "policy_vanilla_vs_value_winner/mean_cosine"
+                        ] = mean_cosine
+
+                    if (
+                        self._primary_component_keys
+                        and self._aux_component_keys
+                    ):
+                        primary_grads = nnx.grad(
+                            lambda m, b, t: sum_component_loss(
+                                m, b, t, self._primary_component_keys
+                            )
+                        )(model, batch, teacher_model)
+                        aux_grads = nnx.grad(
+                            lambda m, b, t: sum_component_loss(
+                                m, b, t, self._aux_component_keys
+                            )
+                        )(model, batch, teacher_model)
+                        conflict_ratio, mean_cosine = (
+                            _conflict_ratio_and_cosine(
+                                primary_grads["encoders"],
+                                aux_grads["encoders"],
+                            )
+                        )
+                        new_metrics[
+                            "grad_conflict/primary_vs_aux/conflict_ratio"
+                        ] = conflict_ratio
+                        new_metrics["grad_conflict/primary_vs_aux/mean_cosine"] = (
+                            mean_cosine
+                        )
+
+                if self._advanced_metrics.enable_ln2_collapse_diagnostics:
+
+                    def encoder_out(sample_inputs: jax.Array) -> jax.Array:
+                        x = jnp.transpose(sample_inputs, (1, 2, 0))
+                        x = jnp.reshape(x, (64, model._input_channels))
+                        x = model.embedding(x)
+                        x = model.encoders(x)
+                        return jnp.mean(x, axis=0)
+
+                    outputs = jax.vmap(encoder_out)(batch.inputs)
+                    centered = outputs - jnp.mean(
+                        outputs, axis=0, keepdims=True
+                    )
+                    cov = jnp.matmul(centered.T, centered) / jnp.maximum(
+                        outputs.shape[0] - 1, 1
+                    )
+                    eigvals = jnp.linalg.eigvalsh(cov)
+                    eigvals = jnp.clip(eigvals, a_min=0.0)
+                    eig_probs = eigvals / jnp.maximum(jnp.sum(eigvals), EPS)
+                    eig_entropy = -jnp.sum(
+                        eig_probs * jnp.log(jnp.maximum(eig_probs, EPS))
+                    )
+                    new_metrics["ln2_collapse/effective_rank_ratio"] = _safe_divide(
+                        jnp.exp(eig_entropy),
+                        jnp.array(eigvals.shape[0], dtype=jnp.float32),
+                    )
+
+                    final_encoder = model.encoders.encoders.layers[-1]
+                    scales = _norm_scales(final_encoder.ln2)
+                    active_mask = (jnp.abs(scales) >= 0.1).astype(jnp.float32)
+                    channel_energy = jnp.var(outputs, axis=0)
+                    active_energy = jnp.sum(channel_energy * active_mask)
+                    total_energy = jnp.sum(channel_energy)
+                    new_metrics["ln2_collapse/active_channel_energy_ratio"] = (
+                        _safe_divide(active_energy, total_energy)
+                    )
+                metrics.update(new_metrics);
+
+                return metrics
+
+            self._expensive_metrics_fn = _compute_expensive_metrics
+
+    def __del__(self):
+        self_._log_last_step_metrics()
+
+    def _compute_optimizer_metrics(
+        self,
+        model_state: nnx.State,
+        updates: nnx.State,
+        learning_rate: jax.Array,
+    ) -> Dict[str, jax.Array]:
+        metrics: Dict[str, jax.Array] = {}
+        if not self._advanced_metrics.enable_update_to_weight_ratio and (
+            not self._advanced_metrics.enable_weight_decay_ratios
+        ):
+            return metrics
+
+        enc_state = model_state["encoders"]
+        enc_update = updates["encoders"]
+        weight_norm = _leaf_l2_norm(enc_state)
+        update_norm = _leaf_l2_norm(enc_update)
+
+        if self._advanced_metrics.enable_update_to_weight_ratio:
+            metrics["encoder_body/update_to_weight_ratio"] = _safe_divide(
+                update_norm, weight_norm
+            )
+
+        if (
+            not self._advanced_metrics.enable_weight_decay_ratios
+            or not self._optimizer_config.HasField("nadamw")
+        ):
+            return metrics
+
+        nadamw = self._optimizer_config.nadamw
+        decay_mask = make_weights_mask(nadamw.decay_selector, model_state)
+        if self._optimizer_config.HasField("freeze_selector"):
+            freeze_mask = make_weights_mask(
+                self._optimizer_config.freeze_selector, model_state
+            )
+            decay_mask = jax.tree.map(
+                lambda d, f: d and (not f), decay_mask, freeze_mask
+            )
+        decay_mask_enc = decay_mask["encoders"]
+
+        wd_update = jax.tree.map(
+            lambda p, m: (
+                -learning_rate * nadamw.weight_decay * _get_array(p)
+                if m
+                else jnp.zeros_like(_get_array(p))
+            ),
+            enc_state,
+            decay_mask_enc,
+        )
+        wd_norm = _leaf_l2_norm(wd_update)
+        metrics["encoder_body/weight_decay_ratio_vs_update"] = _safe_divide(
+            wd_norm, update_norm
+        )
+        metrics["encoder_body/weight_decay_ratio_vs_weight"] = _safe_divide(
+            wd_norm, weight_norm
+        )
+        return metrics
+
+    def _compute_loss_landscape_metrics(
+        self, weighted_losses: Dict[str, jax.Array]
+    ) -> Dict[str, jax.Array]:
+        if not self._advanced_metrics.enable_auxiliary_loss_ratio:
+            return {}
+        return {
+            "policy_aux_ratio": _weighted_aux_ratio(
+                weighted_losses, "policy", "vanilla"
+            ),
+            "value_aux_ratio": _weighted_aux_ratio(
+                weighted_losses, "value", "winner"
+            ),
+            "movesleft_aux_ratio": _weighted_aux_ratio(
+                weighted_losses, "movesleft", "main"
+            ),
+        }
+
+    def _compute_policy_metrics(
+        self, model: LczeroModel, batch: TrainingBatch
+    ) -> Dict[str, jax.Array]:
+        if not self._advanced_metrics.enable_policy_entropy_logit_scale:
+            return {}
+        if "vanilla" not in model.policy_heads_for_metrics:
+            return {}
+
+        def vanilla_logits(sample_inputs: jax.Array) -> jax.Array:
+            return model(sample_inputs).policy["vanilla"]
+
+        logits = jax.vmap(vanilla_logits)(batch.inputs)
+        entropy, logit_std = _policy_entropy_and_logit_std(logits)
+        masked_entropy, masked_logit_std = _masked_policy_entropy_and_logit_std(
+            logits, batch.probabilities
+        )
+        return {
+            "entropy": entropy,
+            "logit_std": logit_std,
+            "masked_entropy": masked_entropy,
+            "masked_logit_std": masked_logit_std,
+        }
+
+    def _compute_ln2_scale_metrics(
+        self, model: LczeroModel
+    ) -> Dict[str, jax.Array]:
+        if not self._advanced_metrics.enable_ln2_collapse_diagnostics:
+            return {}
+        final_encoder = model.encoders.encoders.layers[-1]
+        scales = _norm_scales(final_encoder.ln2)
+        abs_scales = jnp.abs(scales)
+        return {
+            "active_channel_ratio": jnp.mean(
+                (abs_scales >= 0.1).astype(jnp.float32)
+            ),
+            "near_zero_ratio": jnp.mean(
+                (abs_scales < 1e-3).astype(jnp.float32)
+            ),
+            "channel_utilization_index": _channel_utilization_index(scales),
+        }
 
     def update_swa(
         self, jit_state: JitTrainingState, weight: float
@@ -219,7 +884,7 @@ class Training:
         steps_completed: int,
         total_steps: int,
     ) -> JitTrainingState:
-        """Optionally update SWA based on configured schedule and epoch progress.
+        """Optionally update SWA based on schedule and epoch progress.
 
         Returns the original jit_state when no update is scheduled.
         """
@@ -237,7 +902,7 @@ class Training:
     def _validate_and_prepare_batch(
         self, tensor_tuple: tuple[np.ndarray, ...]
     ) -> TrainingBatch:
-        logger.info("Fetched batch from dataloader")
+        logger.debug("Fetched batch from dataloader")
 
         # Convert tuple to TrainingBatch
         batch = TrainingBatch.from_tuple(tensor_tuple)
@@ -293,6 +958,8 @@ class Training:
     ) -> None:
         if metrics is None:
             return
+        if not logger.isEnabledFor(logging.INFO):
+            return
         step_value = int(metrics["step"])
         local_step = int(metrics["local"])
         num_steps = int(metrics["num_steps"])
@@ -301,10 +968,14 @@ class Training:
         unweighted_losses = {
             k: float(v) for k, v in metrics["unweighted_losses"].items()
         }
+        policy_metrics = {
+            k: float(v) for k, v in metrics.get("policy_vanilla", {}).items()
+        }
         grad_norm = float(metrics["grad_norm"])
         logger.info(
             f"Step {step_value} ({local_step}/{num_steps}), Loss: {loss}, "
-            f"Unweighted losses: {unweighted_losses}, Grad norm: {grad_norm}"
+            f"Unweighted losses: {unweighted_losses}, "
+            f"Policy metrics: {policy_metrics}, Grad norm: {grad_norm}"
         )
 
     def _execute_step_hook(
@@ -333,6 +1004,7 @@ class Training:
         datagen: Generator[tuple[np.ndarray, ...], None, None],
         num_steps: int,
         step_hook: Optional[StepHook] = None,
+        teacher_model_state: Optional[nnx.State] = None,
         memory_profile_dir: Optional[str] = None,
         metrics_collector: Optional[MetricsCollector] = None,
     ) -> JitTrainingState:
@@ -345,7 +1017,8 @@ class Training:
             replicated = jshard.NamedSharding(self._dp_sharding.mesh, P())
             jit_state = jax.device_put(jit_state, replicated)
         for local_step in range(num_steps):
-            logger.info(f"Starting step {self._host_step}")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"Starting step {self._host_step}")
             if memory_profile_dir is not None:
                 jax.profiler.save_device_memory_profile(
                     f"{memory_profile_dir}/"
@@ -353,11 +1026,45 @@ class Training:
                     f"_before_{int(self._host_step)}.prof"
                 )
             batch = self._validate_and_prepare_batch(next(datagen))
+
+            # Compute per-component gradient norms on periodic steps
+            # using a separate JIT function to avoid extra VRAM on
+            # normal steps.
+            component_norms = None
+            if (
+                self._component_norms_fn is not None
+                and self._component_grad_norm_period > 0
+                and local_step % self._component_grad_norm_period == 0
+            ):
+                metrics = self._component_norms_fn(
+                    jit_state, batch, teacher_model_state
+                )
+            else:
+                metrics = {}
+
             jit_state, metrics = self.train_step(
-                self.optimizer_tx, jit_state, batch, metrics_collector=metrics_collector
+                self.optimizer_tx,
+                jit_state,
+                batch,
+                teacher_model_state=teacher_model_state,
+                metrics_collector=metrics_collector,
+                metrics=metrics,
             )
             self._host_step = self._host_step + 1
             step_value = self._host_step
+
+            should_run_expensive = (
+                self._expensive_metrics_fn is not None
+                and self._expensive_metrics_period > 0
+                and step_value % self._expensive_metrics_period == 0
+            )
+            if should_run_expensive:
+                assert self._expensive_metrics_fn is not None
+                metrics = self._expensive_metrics_fn(
+                    jit_state, batch,
+                    teacher_model_state=teacher_model_state,
+                    metrics=metrics,
+                )
             jit_state = self.maybe_update_swa(
                 jit_state, local_step + 1, num_steps
             )

@@ -1,4 +1,5 @@
 import math
+from collections.abc import Callable
 from typing import Optional
 
 import jax
@@ -9,7 +10,95 @@ from flax.linen import initializers as flax_initializers
 from proto import model_config_pb2
 
 from .shared import Ffn
-from .utils import get_activation
+from .utils import get_activation, get_dtype, get_norm_layer
+
+ActivationSink = Callable[[str, jax.Array], None]
+
+
+_SEQUENTIAL_BLOCK_STYLE = (
+    model_config_pb2.EncoderConfig.ENCODER_BLOCK_STYLE_SEQUENTIAL
+)
+_PALM_PARALLEL_BLOCK_STYLE = (
+    model_config_pb2.EncoderConfig.ENCODER_BLOCK_STYLE_PALM_PARALLEL
+)
+
+
+class _LayerConfig:
+    def __init__(
+        self,
+        *,
+        dff: int,
+        heads: int,
+        kv_heads: int,
+        smolgen: Optional[model_config_pb2.SmolgenConfig],
+    ):
+        self.dff = dff
+        self.heads = heads
+        self.kv_heads = kv_heads
+        self.smolgen = smolgen
+
+
+def _build_layer_configs(
+    config: model_config_pb2.EncoderConfig,
+) -> list[_LayerConfig]:
+    layer_configs = [
+        _LayerConfig(
+            dff=config.dff,
+            heads=config.heads,
+            kv_heads=config.kv_heads
+            if config.HasField("kv_heads")
+            else config.heads,
+            smolgen=config.smolgen if config.HasField("smolgen") else None,
+        )
+        for _ in range(config.num_blocks)
+    ]
+    seen = [False] * config.num_blocks
+    base_gen_size = (
+        config.smolgen.gen_size if config.HasField("smolgen") else None
+    )
+    for override in config.layer_override:
+        if not override.HasField("start_layer") or not override.HasField(
+            "end_layer"
+        ):
+            raise ValueError(
+                "layer_override requires start_layer and end_layer."
+            )
+        start = override.start_layer
+        end = override.end_layer
+        if start > end:
+            raise ValueError("layer_override start_layer must be <= end_layer.")
+        if end >= config.num_blocks:
+            raise ValueError("layer_override range exceeds num_blocks.")
+        for idx in range(start, end + 1):
+            if seen[idx]:
+                raise ValueError("Overlapping layer_override ranges are invalid.")
+            seen[idx] = True
+            layer_config = layer_configs[idx]
+            if override.HasField("dff"):
+                layer_config.dff = override.dff
+            if override.HasField("heads"):
+                layer_config.heads = override.heads
+            if override.HasField("kv_heads"):
+                layer_config.kv_heads = override.kv_heads
+            if override.HasField("smolgen"):
+                if base_gen_size is None:
+                    raise ValueError(
+                        "smolgen overrides require encoder.smolgen to be set."
+                    )
+                if (
+                    override.smolgen.HasField("gen_size")
+                    and override.smolgen.gen_size != base_gen_size
+                ):
+                    raise ValueError(
+                        "smolgen.gen_size cannot vary by layer."
+                    )
+                layer_config.smolgen = override.smolgen
+    for layer_config in layer_configs:
+        if layer_config.kv_heads <= 0:
+            raise ValueError("kv_heads must be greater than zero.")
+        if layer_config.heads % layer_config.kv_heads != 0:
+            raise ValueError("heads must be divisible by kv_heads.")
+    return layer_configs
 
 
 class EncoderTower(nnx.Module):
@@ -22,32 +111,47 @@ class EncoderTower(nnx.Module):
         deepnorm_beta: float,
         rngs: nnx.Rngs,
     ):
+        layer_configs = _build_layer_configs(config)
         smolgen_shared_gen_dense = None
-        assert config.HasField("smolgen")
         if config.HasField("smolgen"):
             smolgen_shared_gen_dense = nnx.Linear(
                 in_features=config.smolgen.gen_size,
                 out_features=64 * 64,
                 use_bias=False,
+                dtype=get_dtype(defaults.compute_dtype),
                 rngs=rngs,
             )
 
+        self.layer_configs = layer_configs
         self.encoders = nnx.Sequential(
             *[
                 EncoderBlock(
                     in_features=in_features,
                     config=config,
+                    layer_config=layer_config,
                     defaults=defaults,
                     smol_gen_dense=smolgen_shared_gen_dense,
                     deepnorm_beta=deepnorm_beta,
                     rngs=rngs,
                 )
-                for _ in range(config.num_blocks)
+                for layer_config in layer_configs
             ]
         )
 
-    def __call__(self, x: jax.Array) -> jax.Array:
-        return self.encoders(x)
+    def __call__(
+        self,
+        x: jax.Array,
+        activation_sink: ActivationSink | None = None,
+    ) -> jax.Array:
+        if activation_sink is None:
+            return self.encoders(x)
+        for layer_idx, encoder in enumerate(self.encoders.layers):
+            x = encoder(
+                x,
+                layer_index=layer_idx,
+                activation_sink=activation_sink,
+            )
+        return x
 
 
 class EncoderBlock(nnx.Module):
@@ -58,37 +162,77 @@ class EncoderBlock(nnx.Module):
         *,
         in_features: int,
         config: model_config_pb2.EncoderConfig,
+        layer_config: _LayerConfig,
         defaults: model_config_pb2.DefaultsConfig,
         smol_gen_dense: Optional[nnx.Linear],
         deepnorm_beta: float,
         rngs: nnx.Rngs,
     ):
-        assert (smol_gen_dense is not None) == config.HasField("smolgen")
+        assert (smol_gen_dense is not None) == (layer_config.smolgen is not None)
         self.mha = MultiHeadAttention(
             in_features=in_features,
-            config=config,
+            d_model=config.d_model,
+            heads=layer_config.heads,
+            kv_heads=layer_config.kv_heads,
+            use_bias_q=config.use_bias_q,
+            use_bias_k=config.use_bias_k,
+            use_bias_v=config.use_bias_v,
+            use_q_scale=config.use_q_scale,
+            smolgen_config=layer_config.smolgen,
             defaults=defaults,
             smol_gen_dense=smol_gen_dense,
             deepnorm_beta=deepnorm_beta,
             rngs=rngs,
         )
+        norm_layer = get_norm_layer(defaults.norm_type)
+        cdt = get_dtype(defaults.compute_dtype)
 
         self.alpha = math.pow(2.0 * config.num_blocks, -0.25)
-        self.ln1 = nnx.LayerNorm(in_features, epsilon=1e-3, rngs=rngs)
+        self.ln1 = norm_layer(in_features, epsilon=1e-3, dtype=cdt, rngs=rngs)
         self.ffn = Ffn(
             in_features=in_features,
-            hidden_features=config.dff,
+            hidden_features=layer_config.dff,
             hidden_activation=defaults.ffn_activation,
             deepnorm_beta=deepnorm_beta,
+            dtype=cdt,
             rngs=rngs,
         )
-        self.ln2 = nnx.LayerNorm(in_features, epsilon=1e-3, rngs=rngs)
+        self.ln2 = norm_layer(in_features, epsilon=1e-3, dtype=cdt, rngs=rngs)
+        self.block_style = config.block_style
+        if self.block_style not in (
+            _SEQUENTIAL_BLOCK_STYLE,
+            _PALM_PARALLEL_BLOCK_STYLE,
+        ):
+            raise ValueError(f"Unsupported block style: {self.block_style}")
 
-    def __call__(self, x: jax.Array) -> jax.Array:
-        x = x + self.mha(x) * self.alpha
-        out1 = self.ln1(x)
-        ffn_out = self.ffn(out1)
-        return self.ln2(out1 + ffn_out * self.alpha)
+    def __call__(
+        self,
+        x: jax.Array,
+        layer_index: int | None = None,
+        activation_sink: ActivationSink | None = None,
+    ) -> jax.Array:
+        if self.block_style == _SEQUENTIAL_BLOCK_STYLE:
+            x = x + self.mha(
+                x, layer_index=layer_index, activation_sink=activation_sink
+            ) * self.alpha
+            out1 = self.ln1(x)
+            ffn_out = self.ffn(
+                out1,
+                layer_index=layer_index,
+                activation_sink=activation_sink,
+            )
+            return self.ln2(out1 + ffn_out * self.alpha)
+
+        normed = self.ln1(x)
+        attn_out = self.mha(
+            normed, layer_index=layer_index, activation_sink=activation_sink
+        )
+        ffn_out = self.ffn(
+            normed,
+            layer_index=layer_index,
+            activation_sink=activation_sink,
+        )
+        return self.ln2(x + (attn_out + ffn_out) * self.alpha)
 
 
 class MultiHeadAttention(nnx.Module):
@@ -97,25 +241,50 @@ class MultiHeadAttention(nnx.Module):
     def __init__(
         self,
         in_features: int,
-        config: model_config_pb2.EncoderConfig,
+        d_model: int,
+        heads: int,
+        kv_heads: int,
+        use_bias_q: bool,
+        use_bias_k: bool,
+        use_bias_v: bool,
+        use_q_scale: bool,
+        smolgen_config: Optional[model_config_pb2.SmolgenConfig],
         defaults: model_config_pb2.DefaultsConfig,
         smol_gen_dense: Optional[nnx.Linear],
         deepnorm_beta: float,
         *,
         rngs: nnx.Rngs,
     ):
-        depth = config.d_model
-        assert depth % config.heads == 0, (
+        depth = d_model
+        assert depth % heads == 0, (
             "Model depth must be divisible by the number of heads."
         )
         self.activation = defaults.activation
         self.depth = depth
-        self.num_heads = config.heads
+        self.num_heads = heads
+        self.kv_heads = kv_heads
+        assert self.num_heads % self.kv_heads == 0
+        head_depth = depth // self.num_heads
+        cdt = get_dtype(defaults.compute_dtype)
+
         self.q = nnx.Linear(
-            in_features=in_features, out_features=depth, rngs=rngs
+            in_features=in_features,
+            out_features=depth,
+            use_bias=use_bias_q,
+            dtype=cdt,
+            rngs=rngs,
         )
+        self.q_scale = None
+        if use_q_scale:
+            self.q_scale = nnx.Param(
+                jnp.ones((self.num_heads, 1, 1), dtype=jnp.float32)
+            )
         self.k = nnx.Linear(
-            in_features=in_features, out_features=depth, rngs=rngs
+            in_features=in_features,
+            out_features=self.kv_heads * head_depth,
+            use_bias=use_bias_k,
+            dtype=cdt,
+            rngs=rngs,
         )
         deepnorm_init = flax_initializers.variance_scaling(
             scale=deepnorm_beta,
@@ -125,55 +294,85 @@ class MultiHeadAttention(nnx.Module):
 
         self.v = nnx.Linear(
             in_features=in_features,
-            out_features=depth,
+            out_features=self.kv_heads * head_depth,
+            use_bias=use_bias_v,
             kernel_init=deepnorm_init,
+            dtype=cdt,
             rngs=rngs,
         )
         self.output_dense = nnx.Linear(
             in_features=depth,
             out_features=in_features,
             kernel_init=deepnorm_init,
+            dtype=cdt,
             rngs=rngs,
         )
 
-        assert (smol_gen_dense is not None) == config.HasField("smolgen")
+        assert (smol_gen_dense is not None) == (smolgen_config is not None)
         self.smolgen: Optional[Smolgen]
         if smol_gen_dense is not None:
             self.smolgen = Smolgen(
                 in_features=in_features,
-                config=config.smolgen,
+                config=smolgen_config,
                 defaults=defaults,
-                heads=config.heads,
+                heads=heads,
                 weight_gen_dense=smol_gen_dense,
                 rngs=rngs,
             )
         else:
             self.smolgen = None
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        x: jax.Array,
+        layer_index: int | None = None,
+        activation_sink: ActivationSink | None = None,
+    ) -> jax.Array:
+        if activation_sink is not None and layer_index is not None:
+            prefix = f"encoders/layers/{layer_index}/mha"
+            activation_sink(f"{prefix}/q/kernel", x)
+            activation_sink(f"{prefix}/k/kernel", x)
+            activation_sink(f"{prefix}/v/kernel", x)
         q, k, v = self.q(x), self.k(x), self.v(x)
 
         head_depth = self.depth // self.num_heads
         # Reshape for multi-head attention.
-        q, k, v = (
-            t.reshape((-1, self.num_heads, head_depth)).transpose((1, 0, 2))
-            for t in (q, k, v)
-        )
+        q = q.reshape((-1, self.num_heads, head_depth)).transpose((1, 0, 2))
+        k = k.reshape((-1, self.kv_heads, head_depth)).transpose((1, 0, 2))
+        v = v.reshape((-1, self.kv_heads, head_depth)).transpose((1, 0, 2))
+
+        if self.kv_heads != self.num_heads:
+            group_size = self.num_heads // self.kv_heads
+            k = jnp.repeat(k, group_size, axis=0)
+            v = jnp.repeat(v, group_size, axis=0)
+
+        if self.q_scale is not None:
+            q = q * self.q_scale.value.astype(q.dtype)
 
         # Scaled dot-product attention.
         logits = jnp.einsum("...qd,...kd->...qk", q, k)
         logits /= jnp.sqrt(k.shape[-1]).astype(k.dtype)
 
         if self.smolgen is not None:
-            logits += self.smolgen(x)
+            logits += self.smolgen(
+                x, layer_index=layer_index, activation_sink=activation_sink
+            )
 
-        attention_weights = nnx.softmax(logits, axis=-1)
+        # Softmax in float32 for numerical stability under bf16/f16 compute.
+        attention_weights = nnx.softmax(
+            logits.astype(jnp.float32), axis=-1
+        ).astype(v.dtype)
         scaled_attention = jnp.matmul(attention_weights, v)
 
         # Reshape back to original dimensions.
         scaled_attention = scaled_attention.transpose((1, 0, 2)).reshape(
             (-1, self.depth)
         )
+        if activation_sink is not None and layer_index is not None:
+            activation_sink(
+                f"encoders/layers/{layer_index}/mha/output_dense/kernel",
+                scaled_attention,
+            )
         return self.output_dense(scaled_attention)
 
 
@@ -191,36 +390,61 @@ class Smolgen(nnx.Module):
         rngs: nnx.Rngs,
     ):
         self.heads = heads
+        norm_layer = get_norm_layer(defaults.norm_type, allow_dynamic_erf=False)
+        cdt = get_dtype(defaults.compute_dtype)
         self.compress = nnx.Linear(
             in_features=in_features,
             out_features=config.hidden_channels,
             use_bias=False,
+            dtype=cdt,
             rngs=rngs,
         )
         self.dense1 = nnx.Linear(
             in_features=config.hidden_channels * 64,
             out_features=config.hidden_size,
+            use_bias=config.use_bias_dense1,
+            dtype=cdt,
             rngs=rngs,
         )
-        self.ln1 = nnx.LayerNorm(config.hidden_size, epsilon=1e-3, rngs=rngs)
+        # Don't use RMSNorm in Smolgen.
+        self.ln1 = nnx.LayerNorm(
+            config.hidden_size, epsilon=1e-3, dtype=cdt, rngs=rngs
+        )
 
         self.dense2 = nnx.Linear(
             in_features=config.hidden_size,
             out_features=config.gen_size * heads,
+            use_bias=config.use_bias_dense2,
+            dtype=cdt,
             rngs=rngs,
         )
-        self.ln2 = nnx.LayerNorm(
-            config.gen_size * heads, epsilon=1e-3, rngs=rngs
+        self.ln2 = norm_layer(
+            config.gen_size * heads, epsilon=1e-3, dtype=cdt, rngs=rngs
         )
         self.weight_gen_dense = weight_gen_dense
         self.activation = config.activation or defaults.activation
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        x: jax.Array,
+        layer_index: int | None = None,
+        activation_sink: ActivationSink | None = None,
+    ) -> jax.Array:
         compressed = self.compress(x).flatten()
+        if activation_sink is not None and layer_index is not None:
+            activation_sink(
+                f"encoders/layers/{layer_index}/mha/smolgen/dense1/kernel",
+                compressed,
+            )
         hidden = self.dense1(compressed)
         hidden = get_activation(self.activation)(hidden)
         hidden = self.ln1(hidden)
 
+        if activation_sink is not None and layer_index is not None:
+            activation_sink(
+                f"encoders/layers/{layer_index}/mha/smolgen/dense2/kernel",
+                hidden,
+            )
         gen_from = self.dense2(hidden)
         gen_from = get_activation(self.activation)(gen_from)
         gen_from = self.ln2(gen_from)

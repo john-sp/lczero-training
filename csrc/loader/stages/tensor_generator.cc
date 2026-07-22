@@ -3,25 +3,41 @@
 
 #include "loader/stages/tensor_generator.h"
 
+#include <array>
+#include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
 #include "absl/algorithm/container.h"
 #include "absl/log/log.h"
+#include "absl/types/span.h"
 #include "loader/data_loader_metrics.h"
 #include "proto/data_loader_config.pb.h"
 #include "proto/training_metrics.pb.h"
+#include "utils/bititer.h"
+#include "utils/dn1_planes.h"
 
 namespace lczero {
 namespace training {
+
+void FillPlaneSliceFromBitboard(absl::Span<float> plane_slice,
+                                const BitBoard& board) {
+  const uint64_t bits = ReverseBitsInBytes(board.as_int());
+  for (ssize_t square = 0; square < 64; ++square) {
+    plane_slice[square] = static_cast<float>((bits >> (square ^ 7)) & 1);
+  }
+}
 
 TensorGenerator::TensorGenerator(const TensorGeneratorConfig& config)
     : SingleInputStage<TensorGeneratorConfig, InputType>(config),
       SingleOutputStage<OutputType>(config.output()),
       batch_size_(config.batch_size()),
+      input_plane_format_(config.input_plane_format()),
       thread_pool_(config.threads(), ThreadPoolOptions{}) {
   LOG(INFO) << "Initializing TensorGenerator with " << config.threads()
             << " threads, batch size " << config.batch_size();
@@ -82,16 +98,36 @@ void TensorGenerator::Worker(std::stop_token stop_token,
   }
 }
 
+namespace {
+
+// Returns true when the V7 reserved block carries data written by the
+// offline rescorer. Frames upgraded from V6 (in-loop or by struct-widening
+// in the chunk sources) have the whole block zeroed. A NaN in the
+// child-Q slot counts as data (it is a deliberately written sentinel).
+bool HasReservedData(const FrameType& frame) {
+  if (frame.version < 7) return false;
+  for (size_t i = 0; i < 4; ++i) {
+    const float v = frame.reserved[i];
+    if (std::isnan(v) || v != 0.0f) return true;
+  }
+  return false;
+}
+
+}  // namespace
+
 TensorTuple TensorGenerator::ConvertFramesToTensors(
     const std::vector<FrameType>& frames) {
   const size_t batch_size = frames.size();
   constexpr size_t kNumPlanes = 112;
   constexpr size_t kNumPolicyMoves = 1858;
-  constexpr size_t kNumValueTypes = 6;
+  constexpr size_t kNumValueTypes = 7;
   constexpr size_t kValuesPerType = 3;
+  constexpr size_t kNumAuxIndices = 3;
+  constexpr size_t kNumAuxTargets = 2;
+  constexpr int32_t kInvalidMoveIndex = 65535;
 
   TensorTuple result;
-  result.reserve(3);
+  result.reserve(5);
 
   // Index 0: Input planes (batch_size, 112, 8, 8)
   auto planes_tensor = std::make_unique<TypedTensor<float>>(
@@ -109,8 +145,9 @@ TensorTuple TensorGenerator::ConvertFramesToTensors(
   }
   result.push_back(std::move(probs_tensor));
 
-  // Index 2: Values (batch_size, 6, 3) with [q, d, m] for each type.
-  // [0]: result, [1]: best, [2]: played, [3]: orig, [4]: root, [5]: st
+  // Index 2: Values (batch_size, 7, 3) with [q, d, m] for each type.
+  // [0]: result, [1]: best, [2]: played, [3]: orig, [4]: root, [5]: st,
+  // [6]: st_censored
   auto values_tensor =
       std::make_unique<TypedTensor<float>>(std::initializer_list<size_t>{
           batch_size, kNumValueTypes, kValuesPerType});
@@ -153,8 +190,61 @@ TensorTuple TensorGenerator::ConvertFramesToTensors(
     st_slice[0] = frame.q_st;
     st_slice[1] = frame.d_st;
     st_slice[2] = std::numeric_limits<float>::quiet_NaN();
+
+    // Index 6: st_censored [reserved[1], reserved[2], NaN], the
+    // blunder-censored short-term value written by the offline rescorer.
+    // Falls back to plain st values when the reserved block carries no
+    // data (V6 input upgraded in-loop).
+    auto st_censored_slice =
+        batch_slice.subspan(6 * kValuesPerType, kValuesPerType);
+    if (HasReservedData(frame)) {
+      st_censored_slice[0] = frame.reserved[1];
+      st_censored_slice[1] = frame.reserved[2];
+    } else {
+      st_censored_slice[0] = frame.q_st;
+      st_censored_slice[1] = frame.d_st;
+    }
+    st_censored_slice[2] = std::numeric_limits<float>::quiet_NaN();
   }
   result.push_back(std::move(values_tensor));
+
+  // Index 3: Aux move indices (batch_size, 3) int32:
+  // [0]: opp_played_idx, [1]: next_played_idx, [2]: played_idx.
+  // 65535 is the "no such move" sentinel, passed through for masking.
+  auto aux_indices_tensor = std::make_unique<TypedTensor<int32_t>>(
+      std::initializer_list<size_t>{batch_size, kNumAuxIndices});
+  for (size_t i = 0; i < batch_size; ++i) {
+    const auto& frame = frames[i];
+    auto aux_slice = aux_indices_tensor->slice({static_cast<ssize_t>(i)});
+    if (frame.version >= 7) {
+      aux_slice[0] = static_cast<int32_t>(frame.opp_played_idx);
+      aux_slice[1] = static_cast<int32_t>(frame.next_played_idx);
+    } else {
+      aux_slice[0] = kInvalidMoveIndex;
+      aux_slice[1] = kInvalidMoveIndex;
+    }
+    aux_slice[2] = static_cast<int32_t>(frame.played_idx);
+  }
+  result.push_back(std::move(aux_indices_tensor));
+
+  // Index 4: Aux targets (batch_size, 2) float32:
+  // [0]: provenance (reserved[0]: 0 none / 1 tablebase / 2 noise-deblunder
+  //      / 3 unintended-deblunder),
+  // [1]: played-move child-Q (reserved[3], NaN when none).
+  auto aux_targets_tensor = std::make_unique<TypedTensor<float>>(
+      std::initializer_list<size_t>{batch_size, kNumAuxTargets});
+  for (size_t i = 0; i < batch_size; ++i) {
+    const auto& frame = frames[i];
+    auto aux_slice = aux_targets_tensor->slice({static_cast<ssize_t>(i)});
+    if (HasReservedData(frame)) {
+      aux_slice[0] = frame.reserved[0];
+      aux_slice[1] = frame.reserved[3];
+    } else {
+      aux_slice[0] = 0.0f;
+      aux_slice[1] = std::numeric_limits<float>::quiet_NaN();
+    }
+  }
+  result.push_back(std::move(aux_targets_tensor));
 
   return result;
 }
@@ -166,19 +256,6 @@ void TensorGenerator::ProcessPlanes(const std::vector<FrameType>& frames,
   for (size_t i = 0; i < batch_size; ++i) {
     const auto& frame = frames[i];
     auto batch_slice = planes_tensor.slice({static_cast<ssize_t>(i)});
-
-    // Process first 104 planes from frame.planes (each uint64_t represents 64
-    // bits).
-    for (ssize_t plane = 0; plane < 104; ++plane) {
-      auto plane_slice = batch_slice.subspan(plane * 64, 64);
-      uint64_t plane_bits = frame.planes[plane];
-
-      for (ssize_t square = 0; square < 64; ++square) {
-        // XOR with 7 remaps the index within each byte from 0..7 to 7..0.
-        plane_slice[square] =
-            static_cast<float>((plane_bits >> (square ^ 7)) & 1);
-      }
-    }
 
     // Add 8 additional planes for metadata (planes 104-111).
     const std::pair<ssize_t, float> meta_planes[] = {
@@ -195,6 +272,87 @@ void TensorGenerator::ProcessPlanes(const std::vector<FrameType>& frames,
     for (const auto& [plane_num, value] : meta_planes) {
       auto plane_slice = batch_slice.subspan(plane_num * 64, 64);
       absl::c_fill(plane_slice, value);
+    }
+
+    const bool zero_geometric_planes =
+        input_plane_format_ == TensorGeneratorConfig::INPUT_PLANE_FORMAT_ZEROED;
+    std::optional<Dn1Planes> dn1_planes;
+    if (!zero_geometric_planes &&
+        input_plane_format_ == TensorGeneratorConfig::INPUT_PLANE_FORMAT_DN1) {
+      dn1_planes = ComputeDn1Planes(frame);
+    }
+
+    // Process first 104 planes from frame.planes (each uint64_t represents 64
+    // bits).
+    for (ssize_t plane = 0; plane < 104; ++plane) {
+      auto plane_slice = batch_slice.subspan(plane * 64, 64);
+      if (zero_geometric_planes && plane >= kDn1FirstPlane &&
+          plane <= kDn1LastPlane) {
+        absl::c_fill(plane_slice, 0.0f);
+        continue;
+      }
+      if (dn1_planes.has_value()) {
+        const Dn1Planes& dn1 = *dn1_planes;
+        if (plane == kDn1SeePositivePlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.see_positive);
+          continue;
+        }
+        if (plane == kDn1SeeEqualPlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.see_equal);
+          continue;
+        }
+        if (plane == kDn1SeeNegativePlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.see_negative);
+          continue;
+        }
+        if (plane == kDn1OurPinsPlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.our_pins);
+          continue;
+        }
+        if (plane == kDn1TheirPinsPlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.their_pins);
+          continue;
+        }
+        if (plane == kDn1OurPassedPawnsPlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.our_passed_pawns);
+          continue;
+        }
+        if (plane == kDn1TheirPassedPawnsPlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.their_passed_pawns);
+          continue;
+        }
+        if (plane == kDn1LegalChecksPlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.legal_checks);
+          continue;
+        }
+        if (plane == kDn1OurDiscoveredChecksPlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.our_discovered_checks);
+          continue;
+        }
+        if (plane == kDn1ControlPlusPlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.control_plus);
+          continue;
+        }
+        if (plane == kDn1ControlEqualPlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.control_equal);
+          continue;
+        }
+        if (plane == kDn1ControlMinusPlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.control_minus);
+          continue;
+        }
+        if (plane == kDn1OurHangingPlane) {
+          FillPlaneSliceFromBitboard(plane_slice, dn1.our_hanging);
+          continue;
+        }
+      }
+
+      uint64_t plane_bits = frame.planes[plane];
+      for (ssize_t square = 0; square < 64; ++square) {
+        // XOR with 7 remaps the index within each byte from 0..7 to 7..0.
+        plane_slice[square] =
+            static_cast<float>((plane_bits >> (square ^ 7)) & 1);
+      }
     }
   }
 }

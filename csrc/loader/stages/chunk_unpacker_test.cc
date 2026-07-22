@@ -265,5 +265,18 @@ TEST(PickSampledPositionsTest, PartialBucketCompletedSize) {
   EXPECT_NEAR(result.size(), n * p, n * p * 0.25);
 }
 
+// A position_sampling (diff-focus) block is only honored in position_count
+// mode; combining it with position_sampling_rate silently drops the weights, so
+// the constructor must reject that configuration up front.
+TEST(ChunkUnpackerConfigTest, RejectsPositionSamplingWithSamplingRate) {
+  ChunkUnpackerConfig config;
+  config.set_threads(1);
+  config.mutable_output()->set_queue_capacity(10);
+  config.set_position_sampling_rate(1.0f);
+  config.mutable_position_sampling()->set_diff_focus_q_weight(1.0f);
+
+  EXPECT_DEATH({ ChunkUnpacker unpacker(config); }, "silently ignored");
+}
+
 }  // namespace training
 }  // namespace lczero

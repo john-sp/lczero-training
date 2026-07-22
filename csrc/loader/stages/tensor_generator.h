@@ -49,6 +49,7 @@ class TensorGenerator
                      TypedTensor<float>& planes_tensor);
 
   size_t batch_size_;
+  TensorGeneratorConfig::InputPlaneFormat input_plane_format_;
   // thread_contexts_ must be declared before thread_pool_ to ensure
   // thread_pool_ is destroyed first (stopping threads before contexts).
   std::vector<std::unique_ptr<ThreadContext>> thread_contexts_;

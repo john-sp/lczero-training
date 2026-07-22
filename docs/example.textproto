@@ -102,11 +102,17 @@ model {
     dff: 1536
     d_model: 1024
     heads: 32
+    use_bias_q: false
+    use_bias_k: false
+    use_bias_v: false
+    use_q_scale: false
     smolgen {
       hidden_channels: 32
       hidden_size: 256
       gen_size: 256
       activation: ACTIVATION_SWISH
+      use_bias_dense1: true
+      use_bias_dense2: true
     }
   }
   policy_head { name: "vanilla" embedding_size: 1024 d_model: 1024 }
@@ -178,6 +184,28 @@ training {
     }
     value { head_name: "winner" weight: 1.0 }
     movesleft { head_name: "main" weight: 1.0 }
+  }
+  teacher {
+    checkpoint_path: "/path/to/teacher/checkpoint"
+    kd_alpha: 0.5       # Weight of the distillation loss
+    temperature: 2.0    # Softmax temperature for soft targets
+    model {
+      defaults {
+        compute_dtype: F32
+        activation: ACTIVATION_MISH
+        ffn_activation: ACTIVATION_MISH
+      }
+      embedding { dense_size: 256 embedding_size: 512 dff: 768 }
+      encoder {
+        num_blocks: 10
+        dff: 768
+        d_model: 512
+        heads: 16
+      }
+      policy_head { name: "vanilla" embedding_size: 512 d_model: 512 }
+      value_head { name: "winner" num_channels: 64 }
+      movesleft_head { name: "main" num_channels: 16 }
+    }
   }
 }
 metrics {

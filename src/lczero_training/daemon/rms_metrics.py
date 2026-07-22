@@ -107,6 +107,9 @@ def collect_rms_metrics(
         for name, head in movesleft_heads.items()
     }
 
+    if model.headpremap is not None:
+        metrics["headpremap"] = compute_rms(nnx.state(model.headpremap))
+
     return metrics
 
 

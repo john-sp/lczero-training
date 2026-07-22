@@ -23,7 +23,11 @@ from lczero_training.model.model import LczeroModel
 from lczero_training.training.lr_schedule import make_lr_schedule
 from lczero_training.training.optimizer import make_gradient_transformation
 from lczero_training.training.state import TrainingState
-from lczero_training.training.training import Training, from_dataloader
+from lczero_training.training.training import (
+    Training,
+    advanced_metrics_options_from_config,
+    from_dataloader,
+)
 from proto.root_config_pb2 import RootConfig
 
 
@@ -56,6 +60,14 @@ def train(config_filename: str) -> None:
     )
 
     logging.info("Creating state from configuration")
+    teacher_model_config = (
+        config.training.teacher.model
+        if config.training.HasField("teacher")
+        and config.training.teacher.HasField("model")
+        else None
+    )
+    # Initialize empty state without teacher model to ensure we can restore
+    # from checkpoints that don't have it. We'll load the teacher separately.
     empty_state = TrainingState.new_from_config(
         model_config=config.model,
         training_config=config.training,
@@ -65,6 +77,30 @@ def train(config_filename: str) -> None:
         None, args=ocp.args.PyTreeRestore(empty_state)
     )
     logging.info("Restored checkpoint")
+
+    teacher_graphdef = None
+    teacher_model_state = None
+    if config.training.HasField("teacher") and teacher_model_config is not None:
+        teacher_config = config.training.teacher
+        logging.info(f"Loading teacher from {teacher_config.checkpoint_path}")
+        teacher_mgr = ocp.CheckpointManager(
+            teacher_config.checkpoint_path,
+            options=ocp.CheckpointManagerOptions(create=False),
+        )
+        # Assuming the teacher checkpoint contains a TrainingState
+        teacher_empty_state = TrainingState.new_from_config(
+            model_config=teacher_model_config,
+            training_config=config.training,
+        )
+        restored_teacher_state = teacher_mgr.restore(
+            None, args=ocp.args.PyTreeRestore(teacher_empty_state)
+        )
+        assert isinstance(restored_teacher_state, TrainingState)
+        teacher_model_state = restored_teacher_state.jit_state.model_state
+
+        teacher_graphdef, _ = nnx.split(
+            LczeroModel(config=teacher_model_config, rngs=nnx.Rngs(params=42))
+        )
 
     model, _ = nnx.split(
         LczeroModel(config=config.model, rngs=nnx.Rngs(params=42))
@@ -77,20 +113,35 @@ def train(config_filename: str) -> None:
     optimizer_tx = make_gradient_transformation(
         config.training.optimizer,
         max_grad_norm=getattr(config.training, "max_grad_norm", 0.0),
+        l2_regularization=getattr(config.training, "l2_regularization", 0.0),
         lr_schedule=lr_sched,
+    )
+    loss_fn = LczeroLoss(
+        config=config.training.losses,
+        teacher_config=(
+            config.training.teacher
+            if config.training.HasField("teacher")
+            else None
+        ),
     )
     training = Training(
         optimizer_tx=optimizer_tx,
         graphdef=model,
-        loss_fn=LczeroLoss(config=config.training.losses),
+        loss_fn=loss_fn,
+        optimizer_config=config.training.optimizer,
+        lr_schedule=lr_sched,
         swa_config=(
             config.training.swa if config.training.HasField("swa") else None
         ),
+        advanced_metrics=advanced_metrics_options_from_config(config.training),
+        teacher_graphdef=teacher_graphdef,
+        component_grad_norm_period=config.training.component_grad_norm_period,
     )
     new_state = training.run(
         jit_state,
         from_dataloader(make_dataloader(config.data_loader)),
         config.training.schedule.steps_per_network,
+        teacher_model_state=teacher_model_state,
     )
 
     if config.export.destination_filename:
@@ -102,6 +153,7 @@ def train(config_filename: str) -> None:
             min_version="0.28",
             num_heads=training_state.num_heads,
             license=None,
+            ffn_activation=config.model.defaults.ffn_activation,
             training_steps=new_state.step,
         )
         export_state = (
@@ -110,7 +162,11 @@ def train(config_filename: str) -> None:
             else new_state.model_state
         )
         assert isinstance(export_state, nnx.State)
-        net = jax_to_leela(jax_weights=export_state, export_options=options)
+        net = jax_to_leela(
+            jax_weights=export_state,
+            export_options=options,
+            model_config=config.model,
+        )
         network_bytes = gzip.compress(net.SerializeToString())
 
         for destination_template in config.export.destination_filename:

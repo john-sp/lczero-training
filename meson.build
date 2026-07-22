@@ -135,6 +135,7 @@ files = [
   'csrc/loader/stages/stage_factory.cc',
   'csrc/loader/stages/stage.cc',
   'csrc/loader/stages/tensor_generator.cc',
+  'csrc/utils/dn1_planes.cc',
   'csrc/utils/gz.cc',
   'csrc/utils/stream_shuffler.cc',
   'csrc/utils/training_data_printer.cc',
@@ -211,6 +212,14 @@ chunk_source_loader_test = executable(
   'csrc/loader/stages/chunk_source_loader_test.cc',
   include_directories : includes,
   dependencies : test_deps + [absl_deps['synchronization']],
+  link_with : loader_lib,
+)
+
+tar_chunk_source_test = executable(
+  'tar_chunk_source_test',
+  'csrc/loader/chunk_source/tar_chunk_source_test.cc',
+  include_directories : includes,
+  dependencies : test_deps + [zlib_dep, absl_deps['log']],
   link_with : loader_lib,
 )
 
@@ -312,6 +321,7 @@ test('stream_shuffler_test', stream_shuffler_test)
 test('queue_test', queue_test)
 test('file_path_provider_test', file_path_provider_test)
 test('chunk_source_loader_test', chunk_source_loader_test)
+test('tar_chunk_source_test', tar_chunk_source_test)
 chunk_source_splitter_test = executable(
   'chunk_source_splitter_test',
   'csrc/loader/stages/chunk_source_splitter_test.cc',

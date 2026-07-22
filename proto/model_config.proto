@@ -4,6 +4,11 @@ import "proto/net.proto";
 import "proto/hlo.proto";
 
 package lczero.training;
+enum NormType {
+  NORM_LAYER_NORM = 0;
+  NORM_RMS_NORM = 1;
+  NORM_DYNAMIC_ERF = 2;
+}
 
 message ModelConfig {
   optional DefaultsConfig defaults = 4;
@@ -13,12 +18,18 @@ message ModelConfig {
   repeated PolicyHeadConfig policy_head = 8;
   repeated ValueHeadConfig value_head = 9;
   repeated MovesLeftHeadConfig movesleft_head = 10;
+  optional pblczero.NetworkFormat.InputFormat input_format = 11;
+  optional HeadpremapConfig headpremap = 12;
+  repeated SimpleHeadConfig simple_value_head = 13;
+  repeated SimpleHeadConfig simple_movesleft_head = 14;
+  repeated SimpleHeadConfig simple_policy_head = 15;
 }
 
 message DefaultsConfig {
   optional pblczero.XlaShapeProto.Type compute_dtype = 2;
   optional pblczero.NetworkFormat.ActivationFunction activation = 4;
   optional pblczero.NetworkFormat.ActivationFunction ffn_activation = 5;
+  optional NormType norm_type = 6;
 }
 
 message EmbeddingConfig {
@@ -33,6 +44,27 @@ message EncoderConfig {
   optional uint32 d_model = 5;
   optional uint32 heads = 6;
   optional SmolgenConfig smolgen = 9;
+  optional bool use_bias_q = 10 [default = true];
+  optional bool use_bias_k = 11 [default = true];
+  optional bool use_bias_v = 12 [default = true];
+  optional uint32 kv_heads = 13;
+  optional bool use_q_scale = 14 [default = false];
+  enum EncoderBlockStyle {
+    ENCODER_BLOCK_STYLE_SEQUENTIAL = 0;
+    ENCODER_BLOCK_STYLE_PALM_PARALLEL = 1;
+  }
+  optional EncoderBlockStyle block_style = 15
+      [default = ENCODER_BLOCK_STYLE_SEQUENTIAL];
+  repeated EncoderLayerOverride layer_override = 16;
+}
+
+message EncoderLayerOverride {
+  optional uint32 start_layer = 1;
+  optional uint32 end_layer = 2;
+  optional uint32 dff = 3;
+  optional uint32 heads = 4;
+  optional uint32 kv_heads = 5;
+  optional SmolgenConfig smolgen = 6;
 }
 
 message SmolgenConfig {
@@ -40,6 +72,14 @@ message SmolgenConfig {
   optional uint32 hidden_size = 2;
   optional uint32 gen_size = 3;
   optional pblczero.NetworkFormat.ActivationFunction activation = 5;
+  optional bool use_bias_dense1 = 6 [default = true];
+  optional bool use_bias_dense2 = 7 [default = true];
+}
+
+message HeadpremapConfig {
+  optional uint32 intermediate_size = 1;
+  optional uint32 output_size = 2;
+  optional bool use_gating = 3 [default = true];
 }
 
 message PolicyHeadConfig {
@@ -58,4 +98,11 @@ message ValueHeadConfig {
 message MovesLeftHeadConfig {
   optional string name = 1;
   optional uint32 num_channels = 2;
+}
+
+message SimpleHeadConfig {
+  optional string name = 1;
+  optional uint32 hidden_size = 2;
+  optional bool has_error_output = 3;
+  optional uint32 num_categorical_buckets = 4;
 }

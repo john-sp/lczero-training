@@ -11,6 +11,7 @@ import shelve
 import sys
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import (
     Any,
     Callable,
@@ -131,10 +132,13 @@ class Dumper:
         to_file: Optional[str],
         to_shelve: Optional[str],
         to_json: Optional[str],
+        to_npz: Optional[str],
     ):
         self.to_stdout = to_stdout
         self.shelve_path = to_shelve
         self.json_path = to_json
+        self.npz_path = to_npz
+        self.npz_records: list[dict] = []
         self.file_handle: Optional[TextIO] = (
             open(to_file, "w") if to_file else None
         )
@@ -158,7 +162,7 @@ class Dumper:
 
     def dump_structured(self, batch: dict, outputs: dict, losses: dict) -> None:
         """Dumps results to structured formats like JSON or shelve."""
-        if not self.shelve_path and not self.json_path:
+        if not self.shelve_path and not self.json_path and not self.npz_path:
             return
 
         all_data = {
@@ -172,6 +176,8 @@ class Dumper:
             self._dump_to_shelve(key, all_data)
         if self.json_path:
             self._dump_to_json(key, all_data)
+        if self.npz_path:
+            self._dump_to_npz(key, all_data)
 
     def _dump_to_shelve(self, key: str, data: dict) -> None:
         assert self.shelve_path is not None
@@ -191,7 +197,23 @@ class Dumper:
             json.dump(json_data, f, indent=2)
         logger.info("Dumped data to JSON with key: %s", key)
 
+    def _dump_to_npz(self, key: str, data: dict) -> None:
+        assert self.npz_path is not None
+        self.npz_records.append({"key": key, "data": data})
+
     def close(self) -> None:
+        if self.npz_path and self.npz_records:
+            output = Path(self.npz_path)
+            if output.parent:
+                output.parent.mkdir(parents=True, exist_ok=True)
+            container = np.empty(len(self.npz_records), dtype=object)
+            container[:] = self.npz_records
+            np.savez(output, samples=container)
+            logger.info(
+                "Dumped %d samples to NPZ: %s",
+                len(self.npz_records),
+                output,
+            )
         if self.file_handle:
             self.file_handle.close()
 
@@ -444,12 +466,16 @@ class Evaluation:
         batch_tuple = next(datagen)
         logger.info("Fetched batch from dataloader")
 
-        # DataLoader now returns tuple: (inputs, probabilities, values)
+        # DataLoader returns tuple: (inputs, probabilities, values,
+        # aux_indices, aux_targets).
         batch = {
             "inputs": cast(jax.Array, jnp.asarray(batch_tuple[0])),
             "probabilities": cast(jax.Array, jnp.asarray(batch_tuple[1])),
             "values": cast(jax.Array, jnp.asarray(batch_tuple[2])),
         }
+        if len(batch_tuple) > 4:
+            batch["aux_indices"] = cast(jax.Array, jnp.asarray(batch_tuple[3]))
+            batch["aux_targets"] = cast(jax.Array, jnp.asarray(batch_tuple[4]))
         dumper.dump_tensors(batch, "INPUT")
 
         predictions = model_output_vfn(model, cast(jax.Array, batch["inputs"]))
@@ -490,6 +516,8 @@ class Evaluation:
             inputs=batch["inputs"],
             probabilities=batch["probabilities"],
             values=batch["values"],
+            aux_indices=batch.get("aux_indices"),
+            aux_targets=batch.get("aux_targets"),
         )
         per_sample_loss, unweighted_losses = loss_vfn(model, batch_sample)
         losses = {
@@ -569,6 +597,7 @@ def eval(
     dump_to_file: Optional[str] = None,
     dump_to_shelve: Optional[str] = None,
     dump_to_json: Optional[str] = None,
+    dump_to_npz: Optional[str] = None,
     onnx_model: Optional[str] = None,
     softmax_jax_wdl: bool = True,
 ) -> None:
@@ -583,7 +612,13 @@ def eval(
     model = _load_model_from_checkpoint(config)
     dl_config = _get_dataloader_config(config, batch_size_override)
     evaluation = Evaluation(loss_fn=LczeroLoss(config=config.training.losses))
-    dumper = Dumper(dump_to_stdout, dump_to_file, dump_to_shelve, dump_to_json)
+    dumper = Dumper(
+        dump_to_stdout,
+        dump_to_file,
+        dump_to_shelve,
+        dump_to_json,
+        dump_to_npz,
+    )
     onnx_comparator = OnnxComparator(onnx_model) if onnx_model else None
 
     samples_to_process = num_samples if num_samples is not None else 10

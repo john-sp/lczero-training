@@ -6,7 +6,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import cast
+from typing import Optional, cast
 
 import jax
 import orbax.checkpoint as ocp
@@ -28,6 +28,7 @@ from lczero_training.training.state import JitTrainingState, TrainingState
 from lczero_training.training.training import (
     StepHookData,
     Training,
+    advanced_metrics_options_from_config,
     from_dataloader,
     MetricsDict,
 )
@@ -113,6 +114,7 @@ class TrainingPipeline:
     _training_state: TrainingState
     _cycle_state: _TrainingCycleState
     _metrics: Metrics | None
+    _teacher_model_state: Optional[nnx.State]
 
     def __init__(
         self,
@@ -130,6 +132,7 @@ class TrainingPipeline:
         self._cycle_state = _TrainingCycleState()
         self._force_training_event = threading.Event()
         self._metrics = None
+        self._teacher_model_state = None
         logger.info("Creating empty model")
         self._model = LczeroModel(self._config.model, rngs=nnx.Rngs(params=42))
         self._graphdef = nnx.graphdef(self._model)
@@ -147,13 +150,19 @@ class TrainingPipeline:
         logger.info("Restoring checkpoint")
         optimizer_config = self._config.training.optimizer
         max_grad_norm = getattr(self._config.training, "max_grad_norm", 0.0)
+        l2_regularization = getattr(
+            self._config.training, "l2_regularization", 0.0
+        )
         self._lr_schedule = make_lr_schedule(self._config.training.lr_schedule)
         optimizer_tx = make_gradient_transformation(
             optimizer_config,
             max_grad_norm=max_grad_norm,
+            l2_regularization=l2_regularization,
             lr_schedule=self._lr_schedule,
         )
         model_state = nnx.state(self._model)
+
+        # Initialize empty state without teacher for restoration compatibility
         jit_state = JitTrainingState(
             step=0,
             model_state=model_state,
@@ -175,20 +184,72 @@ class TrainingPipeline:
             ),
         )
 
+        teacher_model_config = (
+            self._config.training.teacher.model
+            if self._config.training.HasField("teacher")
+            and self._config.training.teacher.HasField("model")
+            else None
+        )
+        teacher_graphdef = None
+        if (
+            self._config.training.HasField("teacher")
+            and teacher_model_config is not None
+        ):
+            teacher_config = self._config.training.teacher
+            logger.info(
+                f"Loading teacher from {teacher_config.checkpoint_path}"
+            )
+            teacher_mgr = ocp.CheckpointManager(
+                teacher_config.checkpoint_path,
+                options=ocp.CheckpointManagerOptions(create=False),
+            )
+            teacher_empty_state = TrainingState.new_from_config(
+                model_config=teacher_model_config,
+                training_config=self._config.training,
+            )
+            restored_teacher_state = teacher_mgr.restore(
+                None, args=ocp.args.PyTreeRestore(teacher_empty_state)
+            )
+            assert isinstance(restored_teacher_state, TrainingState)
+            self._teacher_model_state = (
+                restored_teacher_state.jit_state.model_state
+            )
+
+            teacher_graphdef, _ = nnx.split(
+                LczeroModel(
+                    config=teacher_model_config, rngs=nnx.Rngs(params=42)
+                )
+            )
+
         logger.info("Creating training session")
-        loss_fn = LczeroLoss(config=self._config.training.losses)
+        loss_fn = LczeroLoss(
+            config=self._config.training.losses,
+            teacher_config=(
+                self._config.training.teacher
+                if self._config.training.HasField("teacher")
+                else None
+            ),
+        )
         self._training = Training(
             optimizer_tx=make_gradient_transformation(
                 self._config.training.optimizer,
                 max_grad_norm=max_grad_norm,
+                l2_regularization=l2_regularization,
                 lr_schedule=self._lr_schedule,
             ),
             graphdef=nnx.graphdef(self._model),
             loss_fn=loss_fn,
+            optimizer_config=self._config.training.optimizer,
+            lr_schedule=self._lr_schedule,
             swa_config=(
                 self._config.training.swa
                 if self._config.training.HasField("swa")
                 else None
+            ),
+            teacher_graphdef=teacher_graphdef,
+            component_grad_norm_period=self._config.training.component_grad_norm_period,
+            advanced_metrics=advanced_metrics_options_from_config(
+                self._config.training
             ),
         )
 
@@ -250,6 +311,7 @@ class TrainingPipeline:
             min_version="0.31",
             num_heads=self._training_state.num_heads,
             license=None,
+            ffn_activation=self._config.model.defaults.ffn_activation,
             training_steps=self._training_state.jit_state.step,
         )
         export_state = (
@@ -258,7 +320,11 @@ class TrainingPipeline:
             else self._training_state.jit_state.model_state
         )
         assert isinstance(export_state, nnx.State)
-        net = jax_to_leela(jax_weights=export_state, export_options=options)
+        net = jax_to_leela(
+            jax_weights=export_state,
+            export_options=options,
+            model_config=self._config.model,
+        )
         return gzip.compress(net.SerializeToString())
 
     def _save_network(self, network_bytes: bytes) -> None:
@@ -345,6 +411,7 @@ class TrainingPipeline:
             step_hook=self._step_hook,
             metrics_collector=self._metrics_collector if self._metrics is not None else None,
             memory_profile_dir=self._memory_profile_dir,
+            teacher_model_state=self._teacher_model_state,
         )
         self._training_state = self._training_state.replace(
             jit_state=new_jit_state

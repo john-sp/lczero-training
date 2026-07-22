@@ -7,7 +7,7 @@ from flax import nnx
 
 from proto import model_config_pb2
 
-from .utils import get_activation  # , get_policy_map
+from .utils import get_activation, get_dtype  # , get_policy_map
 
 
 class PolicyHead(nnx.Module):
@@ -24,6 +24,7 @@ class PolicyHead(nnx.Module):
             "embedding_size"
         )
         self.activation = defaults.activation
+        cdt = get_dtype(defaults.compute_dtype)
         if shared_embedding is not None:
             self.tokens = shared_embedding
             embedding_size = shared_embedding.out_features
@@ -31,6 +32,7 @@ class PolicyHead(nnx.Module):
             self.tokens = nnx.Linear(
                 in_features=in_features,
                 out_features=config.embedding_size,
+                dtype=cdt,
                 rngs=rngs,
             )
             embedding_size = config.embedding_size
@@ -38,12 +40,14 @@ class PolicyHead(nnx.Module):
         self.q = nnx.Linear(
             in_features=embedding_size,
             out_features=config.d_model,
+            dtype=cdt,
             rngs=rngs,
         )
 
         self.k = nnx.Linear(
             in_features=embedding_size,
             out_features=config.d_model,
+            dtype=cdt,
             rngs=rngs,
         )
 
@@ -52,6 +56,7 @@ class PolicyHead(nnx.Module):
             in_features=config.d_model,
             out_features=4,
             use_bias=False,
+            dtype=cdt,
             rngs=rngs,
         )
 
@@ -89,7 +94,8 @@ class PolicyHead(nnx.Module):
             [policy_attn_logits.flatten(), promotion_logits.flatten()], axis=-1
         )
 
-        return logits[_policy_map]
+        # Full-precision logits for the (1858-way) policy loss.
+        return logits[_policy_map].astype(jnp.float32)
 
 
 # fmt: off

@@ -65,5 +65,11 @@ class TensorboardLogger:
                 tag=tag, scalar_value=value, global_step=global_step
             )
 
+    def log_text(self, step: int, tag: str, text: str) -> None:
+        self._writer.add_text(tag=tag, text_string=text, global_step=step)
+
+    def flush(self) -> None:
+        self._writer.flush()
+
     def close(self) -> None:
         self._writer.close()

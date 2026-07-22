@@ -96,11 +96,16 @@ def jax2leela(
         min_version=min_version,
         num_heads=restored_state.num_heads,
         license=None,
+        ffn_activation=config.model.defaults.ffn_activation,
         training_steps=restored_state.jit_state.step,
     )
 
     logging.info("Converting to Leela format")
-    net = jax_to_leela(jax_weights=export_state, export_options=options)
+    net = jax_to_leela(
+        jax_weights=export_state,
+        export_options=options,
+        model_config=config.model,
+    )
 
     logging.info("Serializing network")
     network_bytes = gzip.compress(net.SerializeToString())
