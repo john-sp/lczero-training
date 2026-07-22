@@ -4,7 +4,7 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Any
 
 import jax
 import jax.numpy as jnp
@@ -66,9 +66,23 @@ class _TrainingBatchMetric(_Metric):
                 f"Metric '{config.name}': Cannot use SWA model for "
                 "training_batch metrics"
             )
+        self.previous_metrics = None
+
+    def __del__(self):
+        """Ensure that the last metrics are logged before destruction."""
+        self._do_log(self.previous_metrics)
 
     def log(self, hook_data: StepHookData, graphdef: nnx.GraphDef) -> None:
-        self.logger.log(hook_data.global_step, hook_data.metrics)
+        previous = self.previous_metrics
+        self.previous_metrics = {
+            "step": hook_data.global_step,
+            "metrics": hook_data.metrics,
+        }
+        self._do_log(previous)
+
+    def _do_log(self, previous: Optional[Dict[str, Any]] = None) -> None:
+        if previous is not None:
+            self.logger.log(previous['step'], previous['metrics'])
 
 
 class _EvaluatingMetric(_Metric, ABC):
