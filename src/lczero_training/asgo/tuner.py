@@ -42,6 +42,7 @@ from lczero_training.asgo.perturbation import (
     PerturbationManager,
     selected_zero_state,
 )
+from lczero_training.asgo.random_search import best_candidate_index
 from lczero_training.asgo.tournament import (
     RemoteTournamentRunner,
     TournamentRunner,
@@ -57,6 +58,8 @@ from proto import net_pb2
 from proto.root_config_pb2 import RootConfig
 
 logger = logging.getLogger(__name__)
+
+_ASGO_TUNING_RANDOM_SEARCH = 1
 
 
 class TournamentMetricResult(Protocol):
@@ -260,6 +263,12 @@ class AsgoTuner:
                 self.summary_writer.close()
 
     def _run_iteration(self) -> None:
+        if self.asgo.tuning_mode == _ASGO_TUNING_RANDOM_SEARCH:
+            self._run_random_search_iteration()
+            return
+        self._run_gradient_iteration()
+
+    def _run_gradient_iteration(self) -> None:
         logger.info("=== ASGO iteration %d ===", self.iteration)
         iter_start = time.time()
         lr = learning_rate_for_iteration(self.asgo, self.iteration)
@@ -354,6 +363,122 @@ class AsgoTuner:
         self._cleanup_temp_files(self.iteration)
         self.iteration = completed_iteration
 
+    def _run_random_search_iteration(self) -> None:
+        logger.info("=== ASGO random-search iteration %d ===", self.iteration)
+        iter_start = time.time()
+        self._maybe_refresh_agzo()
+
+        adaptive_masks = None
+        if self.asgo.adaptive_mask:
+            adaptive_masks = self.perturbation_mgr.make_adaptive_masks(
+                self.v,
+                self.asgo.adaptive_mask_exponent,
+                self.asgo.adaptive_mask_floor,
+            )
+
+        base_path = self._export_variant(
+            self.model_params,
+            self.iteration,
+            0,
+            "base",
+        )
+        candidates = []
+        for candidate_idx in range(self.asgo.random_search_candidates):
+            self.rng, subkey = jax.random.split(self.rng)
+            delta = self.perturbation_mgr.generate(
+                iteration=self.iteration,
+                rng=subkey,
+                momentum=self.m,
+                adaptive_masks=adaptive_masks,
+            )
+            candidate_params = _apply_delta(
+                self.model_params,
+                delta,
+                sign=1.0,
+            )
+            candidate_path = self._export_variant(
+                candidate_params,
+                self.iteration,
+                candidate_idx,
+                "candidate",
+            )
+            del candidate_params
+            candidates.append(
+                RoundPreparation(
+                    round_idx=candidate_idx,
+                    subkey=subkey,
+                    delta=delta,
+                    pos_path=candidate_path,
+                    neg_path=base_path,
+                )
+            )
+
+        opening_seed = self._random_search_opening_seed()
+        tournament_start = time.time()
+        if isinstance(self.tournament, RemoteTournamentRunner):
+            submitted = [
+                self._submit_prepared_remote_round(
+                    candidate,
+                    opening_seed=opening_seed,
+                )
+                for candidate in candidates
+            ]
+            tournament_results = [future.result() for future in submitted]
+        else:
+            tournament_results = [
+                self._evaluate_prepared_round(
+                    candidate,
+                    opening_seed=opening_seed,
+                )
+                for candidate in candidates
+            ]
+        tournament_time = time.time() - tournament_start
+        elo_diffs = [result.elo_diff for result in tournament_results]
+        for candidate_idx, result in enumerate(tournament_results):
+            logger.info(
+                "ASGO candidate %d/%d: elo=%+.1f WDL=%d/%d/%d",
+                candidate_idx + 1,
+                len(candidates),
+                result.elo_diff,
+                result.wins,
+                result.draws,
+                result.losses,
+            )
+
+        previous_params = self.model_params
+        selected_idx = best_candidate_index(elo_diffs)
+        if selected_idx is None:
+            logger.info("ASGO random search retained the unchanged base.")
+        else:
+            selected = candidates[selected_idx]
+            self.model_params = _apply_delta(
+                self.model_params,
+                selected.delta,
+                sign=1.0,
+            )
+            logger.info(
+                "ASGO random search promoted candidate %d with elo=%+.1f.",
+                selected_idx + 1,
+                elo_diffs[selected_idx],
+            )
+        self.perturbation_mgr.model_params = self.model_params
+
+        self._log_random_search_metrics(
+            elo_diffs=elo_diffs,
+            tournament_results=tournament_results,
+            selected_idx=selected_idx,
+            previous_params=previous_params,
+            deltas=[candidate.delta for candidate in candidates],
+            iteration_seconds=time.time() - iter_start,
+            tournament_seconds=tournament_time,
+        )
+        completed_iteration = self.iteration + 1
+        del candidates, tournament_results, adaptive_masks, previous_params
+        self.checkpoint_mgr.save(self._state_for_next_iteration())
+        self._export_current(completed_iteration)
+        self._cleanup_temp_files(self.iteration)
+        self.iteration = completed_iteration
+
     def _create_tournament_runner(self) -> TournamentRunner:
         lc0_path = self.asgo.lc0_path or "lc0"
         if _has_field(self.asgo.tournament, "remote"):
@@ -379,6 +504,13 @@ class AsgoTuner:
             self.iteration * self.asgo.rounds_per_iteration + round_idx
         )
         return base_seed + round_number * shard_count
+
+    def _random_search_opening_seed(self) -> int | None:
+        base_seed = self.asgo.tournament.opening_seed
+        if base_seed < 0:
+            return None
+        shard_count = max(1, len(self.asgo.tournament.gpu))
+        return base_seed + self.iteration * shard_count
 
     def _run_local_tournament_rounds(
         self,
@@ -505,8 +637,11 @@ class AsgoTuner:
     def _evaluate_prepared_round(
         self,
         prepared: RoundPreparation,
+        *,
+        opening_seed: int | None = None,
     ) -> TournamentMetricResult:
-        opening_seed = self._opening_seed_for_round(prepared.round_idx)
+        if opening_seed is None:
+            opening_seed = self._opening_seed_for_round(prepared.round_idx)
         if self.asgo.tournament.HasField("fixed_opponent"):
             return self.tournament.evaluate_against_opponents(
                 pos_weights_path=prepared.pos_path,
@@ -523,9 +658,12 @@ class AsgoTuner:
     def _submit_prepared_remote_round(
         self,
         prepared: RoundPreparation,
+        *,
+        opening_seed: int | None = None,
     ) -> futures.Future[TournamentMetricResult]:
         tournament = cast(RemoteTournamentRunner, self.tournament)
-        opening_seed = self._opening_seed_for_round(prepared.round_idx)
+        if opening_seed is None:
+            opening_seed = self._opening_seed_for_round(prepared.round_idx)
         if self.asgo.tournament.HasField("fixed_opponent"):
             return cast(
                 futures.Future[TournamentMetricResult],
@@ -824,6 +962,86 @@ class AsgoTuner:
         }
         for round_idx, elo_diff in enumerate(elo_diffs):
             metrics[f"asgo/elo_diff_round_{round_idx}"] = elo_diff
+        self.summary_writer.log(self.iteration, metrics)
+        self.summary_writer.log_text(
+            self.iteration,
+            "asgo/agzo_sketch_dtype",
+            str(jnp.float16),
+        )
+        self.summary_writer.flush()
+
+    def _log_random_search_metrics(
+        self,
+        *,
+        elo_diffs: Sequence[float],
+        tournament_results: Sequence[TournamentMetricResult],
+        selected_idx: int | None,
+        previous_params: nnx.State,
+        deltas: Sequence[nnx.State],
+        iteration_seconds: float,
+        tournament_seconds: float,
+    ) -> None:
+        best_elo = max(elo_diffs)
+        total_games = sum(
+            result.wins + result.draws + result.losses
+            for result in tournament_results
+        )
+        logger.info(
+            "ASGO random-search iteration %d: best elo=%+.1f "
+            "selected=%d games=%d",
+            self.iteration,
+            best_elo,
+            0 if selected_idx is None else selected_idx + 1,
+            total_games,
+        )
+        if self.summary_writer is None:
+            return
+
+        elo_arr = jnp.asarray(elo_diffs, dtype=jnp.float32)
+        update_norm = _tree_delta_norm(self.model_params, previous_params)
+        param_norm = _tree_norm(self.model_params)
+        perturbation_norm = _mean([_tree_norm(delta) for delta in deltas])
+        roundtrip_rms, roundtrip_norm = self._export_roundtrip_metrics(
+            self.model_params
+        )
+        metrics = {
+            "asgo/elo_diff_mean": float(jnp.mean(elo_arr)),
+            "asgo/elo_diff_std": float(jnp.std(elo_arr)),
+            "asgo/elo_diff_max": best_elo,
+            "asgo/random_search_best_elo": best_elo,
+            "asgo/random_search_accepted": float(selected_idx is not None),
+            "asgo/random_search_selected_candidate": (
+                0 if selected_idx is None else selected_idx + 1
+            ),
+            "asgo/random_search_candidates": len(elo_diffs),
+            "asgo/wins": sum(result.wins for result in tournament_results),
+            "asgo/draws": sum(result.draws for result in tournament_results),
+            "asgo/losses": sum(
+                result.losses for result in tournament_results
+            ),
+            "asgo/npm_mean": _mean(
+                [result.npm for result in tournament_results]
+            ),
+            "asgo/export_roundtrip_rms": roundtrip_rms,
+            "asgo/perturbation_to_quantization": _safe_ratio(
+                perturbation_norm, roundtrip_norm
+            ),
+            "asgo/param_update_norm": update_norm,
+            "asgo/perturbation_norm": perturbation_norm,
+            "asgo/delta_w_rel": _safe_ratio(update_norm, param_norm),
+            "asgo/agzo_cache_positions": self._agzo_cache_positions,
+            "asgo/agzo_cache_batch_size": self._agzo_cache_batch_size,
+            "asgo/agzo_basis_orthonormality_error": (
+                self._last_agzo_basis_orthonormality_error
+            ),
+            "asgo/agzo_basis_refresh_time_s": (
+                self._last_agzo_refresh_time_s
+            ),
+            "asgo/iteration_time_s": iteration_seconds,
+            "asgo/tournament_time_s": tournament_seconds,
+        }
+        for candidate_idx, elo_diff in enumerate(elo_diffs):
+            metrics[f"asgo/elo_diff_candidate_{candidate_idx}"] = elo_diff
         self.summary_writer.log(self.iteration, metrics)
         self.summary_writer.log_text(
             self.iteration,
