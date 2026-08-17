@@ -19,6 +19,14 @@ enum AsgoOptimizer {
   ASGO_OPTIMIZER_MUON = 1;
 }
 
+enum AsgoTuningMode {
+  // Estimate a gradient from symmetric perturbations and apply an optimizer.
+  ASGO_TUNING_GRADIENT = 0;
+
+  // Evaluate independent mutations against the base and keep the best one.
+  ASGO_TUNING_RANDOM_SEARCH = 1;
+}
+
 enum AsgoLrScheduleType {
   ASGO_LR_CONSTANT = 0;
   ASGO_LR_COSINE = 1;
@@ -48,6 +56,10 @@ message AsgoConfig {
   // Per-tensor c overrides.
   repeated PerturbationOverride perturbation_overrides = 5;
 
+  // Tuning strategy. Default: gradient optimization.
+  optional AsgoTuningMode tuning_mode = 6
+      [default = ASGO_TUNING_GRADIENT];
+
   // Number of pos/neg pairs per iteration (R). Default: 4.
   optional int32 rounds_per_iteration = 10 [default = 4];
 
@@ -66,6 +78,9 @@ message AsgoConfig {
 
   // Maximum tuning iterations. 0 means run until interrupted.
   optional int32 max_iterations = 15 [default = 0];
+
+  // Number of independent mutations evaluated by random search. Default: 10.
+  optional int32 random_search_candidates = 16 [default = 10];
 
   // Optimizer to use for ASGO updates. Default: Adam.
   optional AsgoOptimizer optimizer = 20 [default = ASGO_OPTIMIZER_ADAM];

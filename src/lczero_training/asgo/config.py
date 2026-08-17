@@ -107,6 +107,11 @@ def validate_asgo_config(
 
     if config.max_iterations < 0:
         errors.append("asgo.max_iterations must be non-negative.")
+    _check_positive(
+        errors,
+        "asgo.random_search_candidates",
+        config.random_search_candidates,
+    )
 
     _check_unit_interval(errors, "asgo.adam_beta1", config.adam_beta1)
     _check_unit_interval(errors, "asgo.adam_beta2", config.adam_beta2)
