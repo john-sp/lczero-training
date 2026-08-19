@@ -21,6 +21,8 @@ from google.protobuf.message import Message
 
 from lczero_training.asgo.elo import (
     DirectTournamentResult,
+    FixedOpponentEvaluationResult,
+    FixedOpponentResult,
     OpponentComparisonResult,
     OpponentEvaluationResult,
     combine_opponent_results,
@@ -163,6 +165,36 @@ class TournamentRunner:
                 )
             )
         return combine_opponent_results(results)
+
+    def evaluate_fixed_candidate(
+        self,
+        weights_path: str,
+        *,
+        opening_seed: int | None = None,
+    ) -> FixedOpponentEvaluationResult:
+        """Evaluates one network against all configured fixed opponents."""
+        results = []
+        for opponent in self.config.fixed_opponent.opponent:
+            cmd, perspective = self._build_fixed_opponent_command(
+                weights_path,
+                opponent,
+                opening_seed=opening_seed,
+            )
+            result = self._run_command_set(
+                cmd,
+                perspective=perspective,
+                mirror_openings=self.config.fixed_opponent.mirror_openings,
+            )
+            results.append(
+                (
+                    opponent.weight,
+                    FixedOpponentResult(
+                        result=result,
+                        opponent_name=opponent.name,
+                    ),
+                )
+            )
+        return FixedOpponentEvaluationResult(tuple(results))
 
     def _build_direct_command(
         self,
@@ -536,6 +568,53 @@ class RemoteTournamentRunner(TournamentRunner):
                 *(opponent.weights for opponent in opponents),
             ),
             build_result=lambda payload: _opponent_result_from_payload(
+                payload,
+                opponents,
+            ),
+        )
+
+    def evaluate_fixed_candidate(
+        self,
+        weights_path: str,
+        *,
+        opening_seed: int | None = None,
+    ) -> FixedOpponentEvaluationResult:
+        return self.submit_fixed_candidate(
+            weights_path,
+            opening_seed=opening_seed,
+        ).result()
+
+    def submit_fixed_candidate(
+        self,
+        weights_path: str,
+        *,
+        opening_seed: int | None = None,
+    ) -> futures.Future[FixedOpponentEvaluationResult]:
+        """Queues one network against all configured fixed opponents."""
+        tasks = []
+        opponents = list(self.config.fixed_opponent.opponent)
+        for opponent in opponents:
+            cmd, perspective = self._build_fixed_opponent_command(
+                weights_path,
+                opponent,
+                opening_seed=opening_seed,
+            )
+            tasks.append(
+                RemoteTournamentTask(
+                    cmd=cmd,
+                    perspective=perspective,
+                    mirror_openings=self.config.fixed_opponent.mirror_openings,
+                    timeout_seconds=float(self.config.timeout_seconds),
+                )
+            )
+
+        return self._submit_round(
+            tasks=tasks,
+            file_paths=self._round_files(
+                weights_path,
+                *(opponent.weights for opponent in opponents),
+            ),
+            build_result=lambda payload: _fixed_opponent_result_from_payload(
                 payload,
                 opponents,
             ),
@@ -946,6 +1025,36 @@ def _direct_result_from_payload(
 ) -> DirectTournamentResult:
     results = _payload_results(payload, expected_count=1)
     return _direct_result_from_dict(results[0])
+
+
+def _fixed_opponent_result_from_payload(
+    payload: dict[str, object],
+    opponents: Sequence[Message],
+) -> FixedOpponentEvaluationResult:
+    """Builds a single-network result from a remote worker payload."""
+    raw_results = payload.get("results")
+    if not isinstance(raw_results, list):
+        raise TournamentError("Remote result payload has no results list.")
+    duplicated_payload = dict(payload)
+    duplicated_payload["results"] = [
+        result for result in raw_results for _ in range(2)
+    ]
+    comparison = _opponent_result_from_payload(
+        duplicated_payload,
+        opponents,
+    )
+    return FixedOpponentEvaluationResult(
+        tuple(
+            (
+                weight,
+                FixedOpponentResult(
+                    result=result.pos_result,
+                    opponent_name=result.opponent_name,
+                ),
+            )
+            for weight, result in comparison.comparisons
+        )
+    )
 
 
 def _opponent_result_from_payload(
