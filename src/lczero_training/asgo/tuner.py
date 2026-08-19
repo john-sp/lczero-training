@@ -32,6 +32,9 @@ from lczero_training.asgo.config import (
     normalize_asgo_config,
     validate_asgo_config,
 )
+from lczero_training.asgo.elo import (
+    compare_fixed_opponent_results,
+)
 from lczero_training.asgo.gradient import compute_gradient
 from lczero_training.asgo.optimizer import (
     anneal_value,
@@ -220,6 +223,7 @@ class AsgoTuner:
         self.beta2_product = initial_state.beta2_product
         self.rng = initial_state.rng
         self.iteration = int(initial_state.iteration)
+        self._random_search_base_path: str | None = None
 
         self.perturbation_mgr = PerturbationManager(
             config=self.asgo,
@@ -376,63 +380,31 @@ class AsgoTuner:
                 self.asgo.adaptive_mask_floor,
             )
 
-        base_path = self._export_variant(
-            self.model_params,
-            self.iteration,
-            0,
-            "base",
-        )
-        candidates = []
-        for candidate_idx in range(self.asgo.random_search_candidates):
+        base_path = self._ensure_random_search_base_path()
+        round_keys = []
+        for _ in range(self.asgo.random_search_candidates):
             self.rng, subkey = jax.random.split(self.rng)
-            delta = self.perturbation_mgr.generate(
-                iteration=self.iteration,
-                rng=subkey,
-                momentum=self.m,
-                adaptive_masks=adaptive_masks,
-            )
-            candidate_params = _apply_delta(
-                self.model_params,
-                delta,
-                sign=1.0,
-            )
-            candidate_path = self._export_variant(
-                candidate_params,
-                self.iteration,
-                candidate_idx,
-                "candidate",
-            )
-            del candidate_params
-            candidates.append(
-                RoundPreparation(
-                    round_idx=candidate_idx,
-                    subkey=subkey,
-                    delta=delta,
-                    pos_path=candidate_path,
-                    neg_path=base_path,
-                )
-            )
+            round_keys.append(subkey)
 
         opening_seed = self._random_search_opening_seed()
-        tournament_start = time.time()
-        if isinstance(self.tournament, RemoteTournamentRunner):
-            submitted = [
-                self._submit_prepared_remote_round(
-                    candidate,
+        if self.asgo.tournament.HasField("fixed_opponent"):
+            candidates, tournament_results, tournament_time = (
+                self._run_fixed_opponent_random_search(
+                    base_path=base_path,
+                    round_keys=round_keys,
+                    adaptive_masks=adaptive_masks,
                     opening_seed=opening_seed,
                 )
-                for candidate in candidates
-            ]
-            tournament_results = [future.result() for future in submitted]
+            )
         else:
-            tournament_results = [
-                self._evaluate_prepared_round(
-                    candidate,
+            candidates, tournament_results, tournament_time = (
+                self._run_direct_random_search(
+                    base_path=base_path,
+                    round_keys=round_keys,
+                    adaptive_masks=adaptive_masks,
                     opening_seed=opening_seed,
                 )
-                for candidate in candidates
-            ]
-        tournament_time = time.time() - tournament_start
+            )
         elo_diffs = [result.elo_diff for result in tournament_results]
         for candidate_idx, result in enumerate(tournament_results):
             logger.info(
@@ -449,6 +421,7 @@ class AsgoTuner:
         selected_idx = best_candidate_index(elo_diffs)
         if selected_idx is None:
             logger.info("ASGO random search retained the unchanged base.")
+            self._random_search_base_path = base_path
         else:
             selected = candidates[selected_idx]
             self.model_params = _apply_delta(
@@ -461,6 +434,7 @@ class AsgoTuner:
                 selected_idx + 1,
                 elo_diffs[selected_idx],
             )
+            self._random_search_base_path = selected.pos_path
         self.perturbation_mgr.model_params = self.model_params
 
         self._log_random_search_metrics(
@@ -476,8 +450,237 @@ class AsgoTuner:
         del candidates, tournament_results, adaptive_masks, previous_params
         self.checkpoint_mgr.save(self._state_for_next_iteration())
         self._export_current(completed_iteration)
-        self._cleanup_temp_files(self.iteration)
+        self._cleanup_temp_files(
+            self.iteration,
+            preserve_path=self._random_search_base_path,
+        )
+        if (
+            self._random_search_base_path is not None
+            and os.path.abspath(base_path)
+            != os.path.abspath(self._random_search_base_path)
+        ):
+            try:
+                os.remove(base_path)
+            except FileNotFoundError:
+                pass
         self.iteration = completed_iteration
+
+    def _ensure_random_search_base_path(self) -> str:
+        if (
+            self._random_search_base_path is not None
+            and os.path.isfile(self._random_search_base_path)
+        ):
+            return self._random_search_base_path
+        self._random_search_base_path = self._export_variant(
+            self.model_params,
+            self.iteration,
+            0,
+            "base",
+        )
+        return self._random_search_base_path
+
+    def _prepare_random_candidate(
+        self,
+        candidate_idx: int,
+        subkey: jax.Array,
+        adaptive_masks: dict[str, jax.Array] | None,
+        base_path: str,
+    ) -> RoundPreparation:
+        delta = self.perturbation_mgr.generate(
+            iteration=self.iteration,
+            rng=subkey,
+            momentum=self.m,
+            adaptive_masks=adaptive_masks,
+        )
+        candidate_params = _apply_delta(
+            self.model_params,
+            delta,
+            sign=1.0,
+        )
+        candidate_path = self._export_variant(
+            candidate_params,
+            self.iteration,
+            candidate_idx,
+            "candidate",
+        )
+        del candidate_params
+        return RoundPreparation(
+            round_idx=candidate_idx,
+            subkey=subkey,
+            delta=delta,
+            pos_path=candidate_path,
+            neg_path=base_path,
+        )
+
+    def _run_fixed_opponent_random_search(
+        self,
+        *,
+        base_path: str,
+        round_keys: Sequence[jax.Array],
+        adaptive_masks: dict[str, jax.Array] | None,
+        opening_seed: int | None,
+    ) -> tuple[
+        list[RoundPreparation],
+        list[TournamentMetricResult],
+        float,
+    ]:
+        start = time.time()
+        if isinstance(self.tournament, RemoteTournamentRunner):
+            return self._run_remote_fixed_opponent_random_search(
+                base_path=base_path,
+                round_keys=round_keys,
+                adaptive_masks=adaptive_masks,
+                opening_seed=opening_seed,
+                start=start,
+            )
+
+        candidates: list[RoundPreparation] = []
+        results: list[TournamentMetricResult] = []
+        with futures.ThreadPoolExecutor(max_workers=1) as export_pool:
+            prepare_future = export_pool.submit(
+                self._prepare_random_candidate,
+                0,
+                round_keys[0],
+                adaptive_masks,
+                base_path,
+            )
+            logger.info("Evaluating the random-search base once.")
+            base_result = self.tournament.evaluate_fixed_candidate(
+                base_path,
+                opening_seed=opening_seed,
+            )
+            for candidate_idx in range(len(round_keys)):
+                candidate = prepare_future.result()
+                candidates.append(candidate)
+                next_idx = candidate_idx + 1
+                if next_idx < len(round_keys):
+                    prepare_future = export_pool.submit(
+                        self._prepare_random_candidate,
+                        next_idx,
+                        round_keys[next_idx],
+                        adaptive_masks,
+                        base_path,
+                    )
+                candidate_result = self.tournament.evaluate_fixed_candidate(
+                    candidate.pos_path,
+                    opening_seed=opening_seed,
+                )
+                results.append(
+                    compare_fixed_opponent_results(
+                        candidate_result,
+                        base_result,
+                    )
+                )
+        return candidates, results, time.time() - start
+
+    def _run_remote_fixed_opponent_random_search(
+        self,
+        *,
+        base_path: str,
+        round_keys: Sequence[jax.Array],
+        adaptive_masks: dict[str, jax.Array] | None,
+        opening_seed: int | None,
+        start: float,
+    ) -> tuple[
+        list[RoundPreparation],
+        list[TournamentMetricResult],
+        float,
+    ]:
+        tournament = cast(RemoteTournamentRunner, self.tournament)
+        base_future = tournament.submit_fixed_candidate(
+            base_path,
+            opening_seed=opening_seed,
+        )
+        candidates: list[RoundPreparation] = []
+        candidate_futures = []
+        for candidate_idx, subkey in enumerate(round_keys):
+            candidate = self._prepare_random_candidate(
+                candidate_idx,
+                subkey,
+                adaptive_masks,
+                base_path,
+            )
+            candidates.append(candidate)
+            candidate_futures.append(
+                tournament.submit_fixed_candidate(
+                    candidate.pos_path,
+                    opening_seed=opening_seed,
+                )
+            )
+
+        base_result = base_future.result()
+        results: list[TournamentMetricResult] = [
+            compare_fixed_opponent_results(future.result(), base_result)
+            for future in candidate_futures
+        ]
+        return candidates, results, time.time() - start
+
+    def _run_direct_random_search(
+        self,
+        *,
+        base_path: str,
+        round_keys: Sequence[jax.Array],
+        adaptive_masks: dict[str, jax.Array] | None,
+        opening_seed: int | None,
+    ) -> tuple[
+        list[RoundPreparation],
+        list[TournamentMetricResult],
+        float,
+    ]:
+        start = time.time()
+        candidates: list[RoundPreparation] = []
+        results: list[TournamentMetricResult] = []
+        if isinstance(self.tournament, RemoteTournamentRunner):
+            tournament = cast(RemoteTournamentRunner, self.tournament)
+            submitted = []
+            for candidate_idx, subkey in enumerate(round_keys):
+                candidate = self._prepare_random_candidate(
+                    candidate_idx,
+                    subkey,
+                    adaptive_masks,
+                    base_path,
+                )
+                candidates.append(candidate)
+                submitted.append(
+                    tournament.submit_pair(
+                        candidate.pos_path,
+                        base_path,
+                        opening_seed=opening_seed,
+                    )
+                )
+            results = [
+                future.result() for future in submitted
+            ]
+            return candidates, results, time.time() - start
+
+        with futures.ThreadPoolExecutor(max_workers=1) as export_pool:
+            prepare_future = export_pool.submit(
+                self._prepare_random_candidate,
+                0,
+                round_keys[0],
+                adaptive_masks,
+                base_path,
+            )
+            for candidate_idx in range(len(round_keys)):
+                candidate = prepare_future.result()
+                candidates.append(candidate)
+                next_idx = candidate_idx + 1
+                if next_idx < len(round_keys):
+                    prepare_future = export_pool.submit(
+                        self._prepare_random_candidate,
+                        next_idx,
+                        round_keys[next_idx],
+                        adaptive_masks,
+                        base_path,
+                    )
+                results.append(
+                    self.tournament.evaluate_pair(
+                        candidate.pos_path,
+                        base_path,
+                        opening_seed=opening_seed,
+                    )
+                )
+        return candidates, results, time.time() - start
 
     def _create_tournament_runner(self) -> TournamentRunner:
         lc0_path = self.asgo.lc0_path or "lc0"
@@ -1056,11 +1259,22 @@ class AsgoTuner:
         del self
         return _export_quantization_metrics(params)
 
-    def _cleanup_temp_files(self, iteration: int) -> None:
+    def _cleanup_temp_files(
+        self,
+        iteration: int,
+        *,
+        preserve_path: str | None = None,
+    ) -> None:
         pattern = os.path.join(
             self.tournament.work_dir, f"iter{iteration}_*.pb.gz"
         )
+        preserved = os.path.abspath(preserve_path) if preserve_path else None
         for filename in glob.glob(pattern):
+            if (
+                preserved is not None
+                and os.path.abspath(filename) == preserved
+            ):
+                continue
             try:
                 os.remove(filename)
             except FileNotFoundError:

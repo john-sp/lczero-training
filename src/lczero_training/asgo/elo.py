@@ -117,3 +117,51 @@ def combine_opponent_results(
     if not results:
         raise ValueError("At least one opponent result is required.")
     return OpponentEvaluationResult(tuple(results))
+
+
+@dataclasses.dataclass(frozen=True)
+class FixedOpponentResult:
+    """One network's result against a named fixed opponent."""
+
+    result: DirectTournamentResult
+    opponent_name: str
+
+
+@dataclasses.dataclass(frozen=True)
+class FixedOpponentEvaluationResult:
+    """One network's weighted results against the fixed opponents."""
+
+    results: tuple[tuple[float, FixedOpponentResult], ...]
+
+
+def compare_fixed_opponent_results(
+    candidate: FixedOpponentEvaluationResult,
+    base: FixedOpponentEvaluationResult,
+) -> OpponentEvaluationResult:
+    """Compares candidate results with one cached base evaluation."""
+    if len(candidate.results) != len(base.results):
+        raise ValueError("Candidate and base opponent results must align.")
+    comparisons = []
+    for candidate_entry, base_entry in zip(
+        candidate.results,
+        base.results,
+        strict=True,
+    ):
+        candidate_weight, candidate_result = candidate_entry
+        base_weight, base_result = base_entry
+        if (
+            candidate_weight != base_weight
+            or candidate_result.opponent_name != base_result.opponent_name
+        ):
+            raise ValueError("Candidate and base opponent results must align.")
+        comparisons.append(
+            (
+                candidate_weight,
+                OpponentComparisonResult(
+                    pos_result=candidate_result.result,
+                    neg_result=base_result.result,
+                    opponent_name=candidate_result.opponent_name,
+                ),
+            )
+        )
+    return combine_opponent_results(comparisons)
