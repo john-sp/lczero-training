@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from typing import Optional, Tuple
 
 import jax
@@ -6,6 +7,8 @@ from flax import nnx
 from proto import model_config_pb2
 
 from .utils import get_activation
+
+ActivationSink = Callable[[str, jax.Array], None]
 
 
 class ValueHead(nnx.Module):
@@ -48,15 +51,31 @@ class ValueHead(nnx.Module):
             )
 
     def __call__(
-        self, x: jax.Array
+        self,
+        x: jax.Array,
+        activation_sink: ActivationSink | None = None,
+        tap_prefix: str = "value_head",
     ) -> Tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
+        if activation_sink is not None:
+            activation_sink(f"{tap_prefix}/embed/kernel", x)
         x = self.embed(x).flatten()
         x = get_activation(self.activation)(x)
+        if activation_sink is not None:
+            activation_sink(f"{tap_prefix}/dense1/kernel", x)
         x = self.dense1(x)
         x = get_activation(self.activation)(x)
 
+        if activation_sink is not None:
+            activation_sink(f"{tap_prefix}/wdl/kernel", x)
         wdl = self.wdl(x)
-        error = nnx.sigmoid(self.error(x)) if self.has_error_output else None
+        if self.has_error_output:
+            if activation_sink is not None:
+                activation_sink(f"{tap_prefix}/error/kernel", x)
+            error = nnx.sigmoid(self.error(x))
+        else:
+            error = None
+        if self.num_categorical_buckets > 0 and activation_sink is not None:
+            activation_sink(f"{tap_prefix}/categorical/kernel", x)
         categorical = (
             self.categorical(x) if self.num_categorical_buckets > 0 else None
         )

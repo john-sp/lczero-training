@@ -1,4 +1,5 @@
 import math
+from collections.abc import Callable
 from typing import Optional
 
 import jax
@@ -8,6 +9,8 @@ from flax import nnx
 from proto import model_config_pb2
 
 from .utils import get_activation  # , get_policy_map
+
+ActivationSink = Callable[[str, jax.Array], None]
 
 
 class PolicyHead(nnx.Module):
@@ -26,6 +29,7 @@ class PolicyHead(nnx.Module):
         self.activation = defaults.activation
         if shared_embedding is not None:
             self.tokens = shared_embedding
+            self.tokens_are_shared = True
             embedding_size = shared_embedding.out_features
         else:
             self.tokens = nnx.Linear(
@@ -33,6 +37,7 @@ class PolicyHead(nnx.Module):
                 out_features=config.embedding_size,
                 rngs=rngs,
             )
+            self.tokens_are_shared = False
             embedding_size = config.embedding_size
 
         self.q = nnx.Linear(
@@ -55,15 +60,34 @@ class PolicyHead(nnx.Module):
             rngs=rngs,
         )
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        x: jax.Array,
+        activation_sink: ActivationSink | None = None,
+        tap_prefix: str = "policy_head",
+    ) -> jax.Array:
+        if activation_sink is not None:
+            tokens_path = (
+                "policy_embedding_shared/kernel"
+                if self.tokens_are_shared
+                else f"{tap_prefix}/tokens/kernel"
+            )
+            activation_sink(tokens_path, x)
         x = self.tokens(x)
         x = get_activation(self.activation)(x)
 
+        if activation_sink is not None:
+            activation_sink(f"{tap_prefix}/q/kernel", x)
+            activation_sink(f"{tap_prefix}/k/kernel", x)
         q = self.q(x)
         k = self.k(x)
         qk = jnp.einsum("qd,kd->qk", q, k)
 
         promotion_keys = k[-8:, :]
+        if activation_sink is not None:
+            activation_sink(
+                f"{tap_prefix}/promotion_dense/kernel", promotion_keys
+            )
         promotion_offsets = self.promotion_dense(promotion_keys)
         promotion_offsets = promotion_offsets.transpose((1, 0)) * self.dk
         # knight offset is added to the other three

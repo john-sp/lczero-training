@@ -386,7 +386,7 @@ class AsgoTuner:
             self.rng, subkey = jax.random.split(self.rng)
             round_keys.append(subkey)
 
-        opening_seed = self._random_search_opening_seed()
+        opening_seed = self._opening_seed_for_iteration()
         if self.asgo.tournament.HasField("fixed_opponent"):
             candidates, tournament_results, tournament_time = (
                 self._run_fixed_opponent_random_search(
@@ -698,17 +698,7 @@ class AsgoTuner:
             supports_opening_seed=True,
         )
 
-    def _opening_seed_for_round(self, round_idx: int) -> int | None:
-        base_seed = self.asgo.tournament.opening_seed
-        if base_seed < 0:
-            return None
-        shard_count = max(1, len(self.asgo.tournament.gpu))
-        round_number = (
-            self.iteration * self.asgo.rounds_per_iteration + round_idx
-        )
-        return base_seed + round_number * shard_count
-
-    def _random_search_opening_seed(self) -> int | None:
+    def _opening_seed_for_iteration(self) -> int | None:
         base_seed = self.asgo.tournament.opening_seed
         if base_seed < 0:
             return None
@@ -844,7 +834,7 @@ class AsgoTuner:
         opening_seed: int | None = None,
     ) -> TournamentMetricResult:
         if opening_seed is None:
-            opening_seed = self._opening_seed_for_round(prepared.round_idx)
+            opening_seed = self._opening_seed_for_iteration()
         if self.asgo.tournament.HasField("fixed_opponent"):
             return self.tournament.evaluate_against_opponents(
                 pos_weights_path=prepared.pos_path,
@@ -866,7 +856,7 @@ class AsgoTuner:
     ) -> futures.Future[TournamentMetricResult]:
         tournament = cast(RemoteTournamentRunner, self.tournament)
         if opening_seed is None:
-            opening_seed = self._opening_seed_for_round(prepared.round_idx)
+            opening_seed = self._opening_seed_for_iteration()
         if self.asgo.tournament.HasField("fixed_opponent"):
             return cast(
                 futures.Future[TournamentMetricResult],
@@ -1118,6 +1108,17 @@ class AsgoTuner:
             lr,
             total_games,
         )
+        update_outside_span, update_in_span = _update_span_fractions(
+            self.model_params,
+            previous_params,
+            deltas,
+        )
+        logger.info(
+            "ASGO optimizer update span: %.1f%% outside evaluated "
+            "perturbations, %.1f%% projected inside.",
+            100.0 * update_outside_span,
+            100.0 * update_in_span,
+        )
         if self.summary_writer is None:
             return
 
@@ -1133,42 +1134,52 @@ class AsgoTuner:
             self.model_params
         )
         metrics = {
-            "asgo/elo_diff_mean": float(jnp.mean(elo_arr)),
-            "asgo/elo_diff_std": float(jnp.std(elo_arr)),
-            "asgo/elo_diff_max": float(jnp.max(jnp.abs(elo_arr))),
-            "asgo/score_mean": score,
-            "asgo/wins": wins,
-            "asgo/draws": draws,
-            "asgo/losses": losses,
-            "asgo/npm_mean": _mean(
+            "asgo/tournament/elo_diff_mean": float(jnp.mean(elo_arr)),
+            "asgo/tournament/elo_diff_std": float(jnp.std(elo_arr)),
+            "asgo/tournament/elo_diff_max": float(
+                jnp.max(jnp.abs(elo_arr))
+            ),
+            "asgo/tournament/score_mean": score,
+            "asgo/tournament/wins": wins,
+            "asgo/tournament/draws": draws,
+            "asgo/tournament/losses": losses,
+            "asgo/tournament/npm_mean": _mean(
                 [result.npm for result in tournament_results]
             ),
-            "asgo/export_roundtrip_rms": roundtrip_rms,
-            "asgo/perturbation_to_quantization": _safe_ratio(
+            "asgo/export/roundtrip_rms": roundtrip_rms,
+            "asgo/export/perturbation_to_quantization": _safe_ratio(
                 perturbation_norm, roundtrip_norm
             ),
-            "asgo/learning_rate": lr,
-            "asgo/beta1": beta1,
-            "asgo/beta2": beta2,
-            "asgo/gradient_norm": gradient_norm,
-            "asgo/param_update_norm": update_norm,
-            "asgo/perturbation_norm": perturbation_norm,
-            "asgo/delta_w_rel": _safe_ratio(update_norm, param_norm),
-            "asgo/agzo_cache_positions": self._agzo_cache_positions,
-            "asgo/agzo_cache_batch_size": self._agzo_cache_batch_size,
-            "asgo/agzo_basis_orthonormality_error": (
+            "asgo/optimizer/learning_rate": lr,
+            "asgo/optimizer/beta1": beta1,
+            "asgo/optimizer/beta2": beta2,
+            "asgo/optimizer/gradient_norm": gradient_norm,
+            "asgo/optimizer/param_update_norm": update_norm,
+            "asgo/optimizer/update_outside_perturbation_span": (
+                update_outside_span
+            ),
+            "asgo/optimizer/update_in_perturbation_span": update_in_span,
+            "asgo/optimizer/delta_w_rel": _safe_ratio(
+                update_norm, param_norm
+            ),
+            "asgo/perturbation/norm": perturbation_norm,
+            "asgo/agzo/cache_positions": self._agzo_cache_positions,
+            "asgo/agzo/cache_batch_size": self._agzo_cache_batch_size,
+            "asgo/agzo/basis_orthonormality_error": (
                 self._last_agzo_basis_orthonormality_error
             ),
-            "asgo/agzo_basis_refresh_time_s": (self._last_agzo_refresh_time_s),
-            "asgo/iteration_time_s": iteration_seconds,
-            "asgo/tournament_time_s": tournament_seconds,
+            "asgo/agzo/basis_refresh_time_s": (
+                self._last_agzo_refresh_time_s
+            ),
+            "asgo/timing/iteration_s": iteration_seconds,
+            "asgo/timing/tournament_s": tournament_seconds,
         }
         for round_idx, elo_diff in enumerate(elo_diffs):
-            metrics[f"asgo/elo_diff_round_{round_idx}"] = elo_diff
+            metrics[f"asgo/tournament/elo_diff_round_{round_idx}"] = elo_diff
         self.summary_writer.log(self.iteration, metrics)
         self.summary_writer.log_text(
             self.iteration,
-            "asgo/agzo_sketch_dtype",
+            "asgo/agzo/sketch_dtype",
             str(jnp.float16),
         )
         self.summary_writer.flush()
@@ -1208,47 +1219,55 @@ class AsgoTuner:
             self.model_params
         )
         metrics = {
-            "asgo/elo_diff_mean": float(jnp.mean(elo_arr)),
-            "asgo/elo_diff_std": float(jnp.std(elo_arr)),
-            "asgo/elo_diff_max": best_elo,
-            "asgo/random_search_best_elo": best_elo,
-            "asgo/random_search_accepted": float(selected_idx is not None),
-            "asgo/random_search_selected_candidate": (
+            "asgo/tournament/elo_diff_mean": float(jnp.mean(elo_arr)),
+            "asgo/tournament/elo_diff_std": float(jnp.std(elo_arr)),
+            "asgo/tournament/elo_diff_max": best_elo,
+            "asgo/random_search/best_elo": best_elo,
+            "asgo/random_search/accepted": float(selected_idx is not None),
+            "asgo/random_search/selected_candidate": (
                 0 if selected_idx is None else selected_idx + 1
             ),
-            "asgo/random_search_candidates": len(elo_diffs),
-            "asgo/wins": sum(result.wins for result in tournament_results),
-            "asgo/draws": sum(result.draws for result in tournament_results),
-            "asgo/losses": sum(
+            "asgo/random_search/candidates": len(elo_diffs),
+            "asgo/tournament/wins": sum(
+                result.wins for result in tournament_results
+            ),
+            "asgo/tournament/draws": sum(
+                result.draws for result in tournament_results
+            ),
+            "asgo/tournament/losses": sum(
                 result.losses for result in tournament_results
             ),
-            "asgo/npm_mean": _mean(
+            "asgo/tournament/npm_mean": _mean(
                 [result.npm for result in tournament_results]
             ),
-            "asgo/export_roundtrip_rms": roundtrip_rms,
-            "asgo/perturbation_to_quantization": _safe_ratio(
+            "asgo/export/roundtrip_rms": roundtrip_rms,
+            "asgo/export/perturbation_to_quantization": _safe_ratio(
                 perturbation_norm, roundtrip_norm
             ),
-            "asgo/param_update_norm": update_norm,
-            "asgo/perturbation_norm": perturbation_norm,
-            "asgo/delta_w_rel": _safe_ratio(update_norm, param_norm),
-            "asgo/agzo_cache_positions": self._agzo_cache_positions,
-            "asgo/agzo_cache_batch_size": self._agzo_cache_batch_size,
-            "asgo/agzo_basis_orthonormality_error": (
+            "asgo/optimizer/param_update_norm": update_norm,
+            "asgo/optimizer/delta_w_rel": _safe_ratio(
+                update_norm, param_norm
+            ),
+            "asgo/perturbation/norm": perturbation_norm,
+            "asgo/agzo/cache_positions": self._agzo_cache_positions,
+            "asgo/agzo/cache_batch_size": self._agzo_cache_batch_size,
+            "asgo/agzo/basis_orthonormality_error": (
                 self._last_agzo_basis_orthonormality_error
             ),
-            "asgo/agzo_basis_refresh_time_s": (
+            "asgo/agzo/basis_refresh_time_s": (
                 self._last_agzo_refresh_time_s
             ),
-            "asgo/iteration_time_s": iteration_seconds,
-            "asgo/tournament_time_s": tournament_seconds,
+            "asgo/timing/iteration_s": iteration_seconds,
+            "asgo/timing/tournament_s": tournament_seconds,
         }
         for candidate_idx, elo_diff in enumerate(elo_diffs):
-            metrics[f"asgo/elo_diff_candidate_{candidate_idx}"] = elo_diff
+            metrics[
+                f"asgo/random_search/elo_diff_candidate_{candidate_idx}"
+            ] = elo_diff
         self.summary_writer.log(self.iteration, metrics)
         self.summary_writer.log_text(
             self.iteration,
-            "asgo/agzo_sketch_dtype",
+            "asgo/agzo/sketch_dtype",
             str(jnp.float16),
         )
         self.summary_writer.flush()
@@ -1340,6 +1359,60 @@ def _tree_delta_arrays(new_tree: object, old_tree: object) -> list[jax.Array]:
         if new_array is not None and old_array is not None:
             arrays.append(new_array - old_array)
     return arrays
+
+
+def _update_span_fractions(
+    new_params: nnx.State,
+    old_params: nnx.State,
+    directions: Sequence[nnx.State],
+) -> tuple[float, float]:
+    """Returns update norm fractions outside and inside a direction span."""
+    if not directions:
+        return 0.0, 0.0
+
+    update = jax.tree.map(lambda new, old: new - old, new_params, old_params)
+    update_sq = _tree_dot(update, update)
+    if update_sq <= 0.0:
+        return 0.0, 0.0
+
+    count = len(directions)
+    gram = np.empty((count, count), dtype=np.float64)
+    update_dots = np.empty((count,), dtype=np.float64)
+    for row, direction in enumerate(directions):
+        update_dots[row] = _tree_dot(direction, update)
+        for col in range(row + 1):
+            dot = _tree_dot(direction, directions[col])
+            gram[row, col] = dot
+            gram[col, row] = dot
+
+    projected_sq = float(
+        update_dots @ np.linalg.pinv(gram, rcond=1e-10) @ update_dots
+    )
+    projected_sq = min(max(projected_sq, 0.0), update_sq)
+    inside = float((projected_sq / update_sq) ** 0.5)
+    outside = float(((update_sq - projected_sq) / update_sq) ** 0.5)
+    return outside, inside
+
+
+def _tree_dot(left: object, right: object) -> float:
+    total = 0.0
+    for left_leaf, right_leaf in zip(
+        jax.tree.leaves(left),
+        jax.tree.leaves(right),
+        strict=True,
+    ):
+        left_array = _as_array(left_leaf)
+        right_array = _as_array(right_leaf)
+        if left_array is None or right_array is None:
+            continue
+        if left_array.shape != right_array.shape:
+            if left_array.shape == () or right_array.shape == ():
+                continue
+            raise ValueError(
+                "Cannot take a tree dot product of differently shaped leaves."
+            )
+        total += float(jnp.sum(left_array * right_array))
+    return total
 
 
 def _export_quantization_metrics(params: nnx.State) -> tuple[float, float]:

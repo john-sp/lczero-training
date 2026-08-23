@@ -195,7 +195,7 @@ def _update_activation_sketches_over_cached_inputs(
         inputs: jax.Array,
     ) -> tuple[tuple[jax.Array, ...], tuple[jax.Array, ...]]:
         activations_by_tap = jax.vmap(
-            lambda sample: _encoder_tap_activations(
+            lambda sample: _tap_activations(
                 restored_model,
                 sample,
                 tap_names,
@@ -234,7 +234,7 @@ def _update_activation_sketches_over_cached_inputs(
             )
 
 
-def _encoder_tap_activations(
+def _tap_activations(
     model: LczeroModel,
     sample: jax.Array,
     tap_names: tuple[str, ...],
@@ -251,12 +251,61 @@ def _encoder_tap_activations(
     x = jnp.transpose(x, (1, 2, 0))
     x = jnp.reshape(x, (64, model._input_channels))
     x = model.embedding(x)
-    model.encoders(x, activation_sink=sink)
+    x = model.encoders(x, activation_sink=sink)
+    shared_policy_tap = "policy_embedding_shared/kernel" in tap_set
+    for name, head in model.value_heads.items():
+        prefix = f"value_heads/{name}"
+        if not any(tap.startswith(f"{prefix}/") for tap in tap_set):
+            continue
+        head(
+            x,
+            activation_sink=sink,
+            tap_prefix=prefix,
+        )
+    for name, head in model.policy_heads.items():
+        prefix = f"policy_heads/{name}"
+        head_requested = any(
+            tap.startswith(f"{prefix}/") for tap in tap_set
+        )
+        if not head_requested and not shared_policy_tap:
+            continue
+        head(
+            x,
+            activation_sink=sink,
+            tap_prefix=prefix,
+        )
+        if shared_policy_tap:
+            shared_policy_tap = False
     return tuple(activations[tap_name] for tap_name in tap_names)
 
 
 def _expected_d_in(model: LczeroModel, tap_name: str) -> int:
     tap_name = _canonical_tap_name(tap_name)
+    parts = tap_name.split("/")
+    if parts == ["policy_embedding_shared", "kernel"]:
+        shared_embedding = getattr(model, "policy_embedding_shared", None)
+        if shared_embedding is None:
+            raise ValueError("Tap requires a shared policy embedding.")
+        return shared_embedding.in_features
+    if len(parts) >= 4 and parts[0] == "policy_heads":
+        head = model.policy_heads[parts[1]]
+        layer = parts[2]
+        if layer not in ("tokens", "q", "k", "promotion_dense"):
+            raise ValueError(f"Unsupported ASGO tap name: {tap_name}")
+        if layer == "tokens" and head.tokens_are_shared:
+            raise ValueError(
+                "Use policy_embedding_shared/kernel for the shared policy "
+                "embedding tap."
+            )
+        return getattr(head, layer).in_features
+    if len(parts) >= 4 and parts[0] == "value_heads":
+        head = model.value_heads[parts[1]]
+        layer = parts[2]
+        if layer not in ("embed", "dense1", "wdl", "error", "categorical"):
+            raise ValueError(f"Unsupported ASGO tap name: {tap_name}")
+        if not hasattr(head, layer):
+            raise ValueError(f"Model does not contain tap {tap_name}.")
+        return getattr(head, layer).in_features
     if "/ffn/linear2/kernel" in tap_name:
         layer_idx = _layer_index(tap_name)
         layer_config = model.encoders.layer_configs[layer_idx]

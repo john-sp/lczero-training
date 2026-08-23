@@ -218,8 +218,22 @@ class LczeroModel(nnx.Module):
                 for name, head in self.simple_movesleft_heads.items()
             }
         else:
-            value = {name: head(x) for name, head in self.value_heads.items()}
-            policy = {name: head(x) for name, head in self.policy_heads.items()}
+            value = {
+                name: head(
+                    x,
+                    activation_sink=activation_sink,
+                    tap_prefix=f"value_heads/{name}",
+                )
+                for name, head in self.value_heads.items()
+            }
+            policy = {
+                name: head(
+                    x,
+                    activation_sink=activation_sink,
+                    tap_prefix=f"policy_heads/{name}",
+                )
+                for name, head in self.policy_heads.items()
+            }
             movesleft = {
                 name: head(x) for name, head in self.movesleft_heads.items()
             }
