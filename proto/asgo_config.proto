@@ -146,7 +146,9 @@ message AsgoConfig {
   optional int32 agzo_refresh_interval = 71 [default = 5];
 
   // Per-tap rank configuration. Tap names should be weight/tap paths, e.g.
-  // "encoders/layers/3/ffn/linear1/kernel".
+  // "encoders/layers/3/ffn/linear1/kernel",
+  // "policy_heads/vanilla/q/kernel", or
+  // "value_heads/winner/dense1/kernel".
   repeated AgzoRank agzo_rank = 72;
 
   // Coupling specs for multi-layer AGZO.
