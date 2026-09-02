@@ -1134,52 +1134,52 @@ class AsgoTuner:
             self.model_params
         )
         metrics = {
-            "asgo/tournament/elo_diff_mean": float(jnp.mean(elo_arr)),
-            "asgo/tournament/elo_diff_std": float(jnp.std(elo_arr)),
-            "asgo/tournament/elo_diff_max": float(
+            "asgo-tournament/elo_diff_mean": float(jnp.mean(elo_arr)),
+            "asgo-tournament/elo_diff_std": float(jnp.std(elo_arr)),
+            "asgo-tournament/elo_diff_max": float(
                 jnp.max(jnp.abs(elo_arr))
             ),
-            "asgo/tournament/score_mean": score,
-            "asgo/tournament/wins": wins,
-            "asgo/tournament/draws": draws,
-            "asgo/tournament/losses": losses,
-            "asgo/tournament/npm_mean": _mean(
+            "asgo-tournament/score_mean": score,
+            "asgo-tournament/wins": wins,
+            "asgo-tournament/draws": draws,
+            "asgo-tournament/losses": losses,
+            "asgo-tournament/npm_mean": _mean(
                 [result.npm for result in tournament_results]
             ),
-            "asgo/export/roundtrip_rms": roundtrip_rms,
-            "asgo/export/perturbation_to_quantization": _safe_ratio(
+            "asgo-export/roundtrip_rms": roundtrip_rms,
+            "asgo-export/perturbation_to_quantization": _safe_ratio(
                 perturbation_norm, roundtrip_norm
             ),
-            "asgo/optimizer/learning_rate": lr,
-            "asgo/optimizer/beta1": beta1,
-            "asgo/optimizer/beta2": beta2,
-            "asgo/optimizer/gradient_norm": gradient_norm,
-            "asgo/optimizer/param_update_norm": update_norm,
-            "asgo/optimizer/update_outside_perturbation_span": (
+            "asgo-optimizer/learning_rate": lr,
+            "asgo-optimizer/beta1": beta1,
+            "asgo-optimizer/beta2": beta2,
+            "asgo-optimizer/gradient_norm": gradient_norm,
+            "asgo-optimizer/param_update_norm": update_norm,
+            "asgo-optimizer/update_outside_perturbation_span": (
                 update_outside_span
             ),
-            "asgo/optimizer/update_in_perturbation_span": update_in_span,
-            "asgo/optimizer/delta_w_rel": _safe_ratio(
+            "asgo-optimizer/update_in_perturbation_span": update_in_span,
+            "asgo-optimizer/delta_w_rel": _safe_ratio(
                 update_norm, param_norm
             ),
-            "asgo/perturbation/norm": perturbation_norm,
-            "asgo/agzo/cache_positions": self._agzo_cache_positions,
-            "asgo/agzo/cache_batch_size": self._agzo_cache_batch_size,
-            "asgo/agzo/basis_orthonormality_error": (
+            "asgo-perturbation/norm": perturbation_norm,
+            "asgo-agzo/cache_positions": self._agzo_cache_positions,
+            "asgo-agzo/cache_batch_size": self._agzo_cache_batch_size,
+            "asgo-agzo/basis_orthonormality_error": (
                 self._last_agzo_basis_orthonormality_error
             ),
-            "asgo/agzo/basis_refresh_time_s": (
+            "asgo-agzo/basis_refresh_time_s": (
                 self._last_agzo_refresh_time_s
             ),
-            "asgo/timing/iteration_s": iteration_seconds,
-            "asgo/timing/tournament_s": tournament_seconds,
+            "asgo-timing/iteration_s": iteration_seconds,
+            "asgo-timing/tournament_s": tournament_seconds,
         }
         for round_idx, elo_diff in enumerate(elo_diffs):
-            metrics[f"asgo/tournament/elo_diff_round_{round_idx}"] = elo_diff
+            metrics[f"asgo-tournament/elo_diff_round_{round_idx}"] = elo_diff
         self.summary_writer.log(self.iteration, metrics)
         self.summary_writer.log_text(
             self.iteration,
-            "asgo/agzo/sketch_dtype",
+            "asgo-agzo/sketch_dtype",
             str(jnp.float16),
         )
         self.summary_writer.flush()
@@ -1219,55 +1219,55 @@ class AsgoTuner:
             self.model_params
         )
         metrics = {
-            "asgo/tournament/elo_diff_mean": float(jnp.mean(elo_arr)),
-            "asgo/tournament/elo_diff_std": float(jnp.std(elo_arr)),
-            "asgo/tournament/elo_diff_max": best_elo,
-            "asgo/random_search/best_elo": best_elo,
-            "asgo/random_search/accepted": float(selected_idx is not None),
-            "asgo/random_search/selected_candidate": (
+            "asgo-tournament/elo_diff_mean": float(jnp.mean(elo_arr)),
+            "asgo-tournament/elo_diff_std": float(jnp.std(elo_arr)),
+            "asgo-tournament/elo_diff_max": best_elo,
+            "asgo-random-search/best_elo": best_elo,
+            "asgo-random-search/accepted": float(selected_idx is not None),
+            "asgo-random-search/selected_candidate": (
                 0 if selected_idx is None else selected_idx + 1
             ),
-            "asgo/random_search/candidates": len(elo_diffs),
-            "asgo/tournament/wins": sum(
+            "asgo-random-search/candidates": len(elo_diffs),
+            "asgo-tournament/wins": sum(
                 result.wins for result in tournament_results
             ),
-            "asgo/tournament/draws": sum(
+            "asgo-tournament/draws": sum(
                 result.draws for result in tournament_results
             ),
-            "asgo/tournament/losses": sum(
+            "asgo-tournament/losses": sum(
                 result.losses for result in tournament_results
             ),
-            "asgo/tournament/npm_mean": _mean(
+            "asgo-tournament/npm_mean": _mean(
                 [result.npm for result in tournament_results]
             ),
-            "asgo/export/roundtrip_rms": roundtrip_rms,
-            "asgo/export/perturbation_to_quantization": _safe_ratio(
+            "asgo-export/roundtrip_rms": roundtrip_rms,
+            "asgo-export/perturbation_to_quantization": _safe_ratio(
                 perturbation_norm, roundtrip_norm
             ),
-            "asgo/optimizer/param_update_norm": update_norm,
-            "asgo/optimizer/delta_w_rel": _safe_ratio(
+            "asgo-optimizer/param_update_norm": update_norm,
+            "asgo-optimizer/delta_w_rel": _safe_ratio(
                 update_norm, param_norm
             ),
-            "asgo/perturbation/norm": perturbation_norm,
-            "asgo/agzo/cache_positions": self._agzo_cache_positions,
-            "asgo/agzo/cache_batch_size": self._agzo_cache_batch_size,
-            "asgo/agzo/basis_orthonormality_error": (
+            "asgo-perturbation/norm": perturbation_norm,
+            "asgo-agzo/cache_positions": self._agzo_cache_positions,
+            "asgo-agzo/cache_batch_size": self._agzo_cache_batch_size,
+            "asgo-agzo/basis_orthonormality_error": (
                 self._last_agzo_basis_orthonormality_error
             ),
-            "asgo/agzo/basis_refresh_time_s": (
+            "asgo-agzo/basis_refresh_time_s": (
                 self._last_agzo_refresh_time_s
             ),
-            "asgo/timing/iteration_s": iteration_seconds,
-            "asgo/timing/tournament_s": tournament_seconds,
+            "asgo-timing/iteration_s": iteration_seconds,
+            "asgo-timing/tournament_s": tournament_seconds,
         }
         for candidate_idx, elo_diff in enumerate(elo_diffs):
             metrics[
-                f"asgo/random_search/elo_diff_candidate_{candidate_idx}"
+                f"asgo-random-search/elo_diff_candidate_{candidate_idx}"
             ] = elo_diff
         self.summary_writer.log(self.iteration, metrics)
         self.summary_writer.log_text(
             self.iteration,
-            "asgo/agzo/sketch_dtype",
+            "asgo-agzo/sketch_dtype",
             str(jnp.float16),
         )
         self.summary_writer.flush()
