@@ -25,7 +25,7 @@ from proto.training_config_pb2 import (
 )
 
 from .model import LczeroModel, ModelPrediction
-
+from .onnx_teacher import OnnxTeacher
 
 MASKED_POLICY_LOGIT = -1.0e10
 
@@ -173,6 +173,11 @@ class LczeroLoss:
     ) -> None:
         self.config = config
         self.teacher_config = teacher_config
+        self.onnx_teacher = (
+            OnnxTeacher(teacher_config)
+            if teacher_config is not None and teacher_config.onnx_path
+            else None
+        )
         self.policy_losses = [
             PolicyLoss(loss_config) for loss_config in config.policy
         ]
@@ -266,6 +271,13 @@ class LczeroLoss:
 
     def _register_teacher_loss_weights(self) -> None:
         assert self.teacher_config is not None
+        if self.onnx_teacher is not None:
+            for family in ("policy", "value"):
+                for head in getattr(self.teacher_config, family):
+                    self._loss_weights[f"kd/{family}/{head.head_name}"] = (
+                        head.kd_alpha
+                    )
+            return
         self._register_teacher_head_loss_weights(
             "policy",
             list(self.teacher_config.model.policy_head)
@@ -409,8 +421,17 @@ class LczeroLoss:
             unweighted_losses[f"regularization/{reg_loss.metric_name}"] = loss
             weighted_losses.append(loss * reg_loss.weight)
 
-        if teacher_model is not None and self.teacher_config is not None:
-            teacher_predictions = teacher_model(sample.inputs)
+        teacher = self.onnx_teacher or teacher_model
+        if teacher is not None and self.teacher_config is not None:
+            teacher_predictions = teacher(sample.inputs)
+            if self.onnx_teacher is not None:
+                for family in ("policy", "value"):
+                    for head_name in getattr(teacher_predictions, family):
+                        if head_name not in getattr(predictions, family):
+                            raise ValueError(
+                                f"ONNX {family} head {head_name!r} is absent "
+                                "from the student model"
+                            )
             global_kd_alpha = self.teacher_config.kd_alpha
             global_temp = _positive_temperature_or_one(
                 self.teacher_config.temperature

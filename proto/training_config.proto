@@ -33,18 +33,28 @@ message TeacherConfig {
   ModelConfig model = 4;
   repeated TeacherPolicyConfig policy = 5;
   repeated TeacherValueConfig value = 6;
+  // ONNX teacher, mutually exclusive with checkpoint_path and model.
+  string onnx_path = 7;
 }
 
 message TeacherPolicyConfig {
   string head_name = 1;
   float kd_alpha = 2;
   float temperature = 3;
+  // ONNX output mapped to this student head. Required for ONNX teachers.
+  string output_name = 4;
+  // Convert probabilities to logits before applying KD temperature.
+  bool output_is_probabilities = 5;
 }
 
 message TeacherValueConfig {
   string head_name = 1;
   float kd_alpha = 2;
   float temperature = 3;
+  // ONNX output mapped to this student head. Required for ONNX teachers.
+  string output_name = 4;
+  // Convert probabilities to logits before applying KD temperature.
+  bool output_is_probabilities = 5;
 }
 
 message AdvancedMetricsConfig {
